@@ -1,0 +1,15 @@
+<!doctype html>
+<html><head><title>Test Form Page</title></head>
+<body>
+<h1>Test Page</h1>
+<p>This is a test page for R.A.V.E.N's browser tools.</p>
+<button id="toggle" onclick="document.getElementById('hidden').style.display='block'">Show More</button>
+<div id="hidden" style="display:none">Hidden content revealed!</div>
+
+<form id="myform" onsubmit="event.preventDefault(); document.getElementById('result').innerText='Form was submitted with: ' + document.getElementById('name').value;">
+  <label for="name">Your Name</label>
+  <input type="text" id="name" name="name" placeholder="Enter your name">
+  <button type="submit">Submit Form</button>
+</form>
+<div id="result"></div>
+</body></html>

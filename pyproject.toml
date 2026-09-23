@@ -15,9 +15,18 @@ dependencies = [
 
 ]
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [project.scripts]
 raven = "raven.cli:main"
 
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+markers = [
+    "live: hits the real OpenRouter API or a real Google account — costs money/quota, needs credentials. Skipped by default.",
+]
+addopts = "-m 'not live'"

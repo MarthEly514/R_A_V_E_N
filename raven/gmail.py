@@ -22,6 +22,8 @@ import re
 from email.mime.text import MIMEText
 from pathlib import Path
 
+AGENT_NAME = "R.A.V.E.N"
+SIGNATURE = f"-- \n{AGENT_NAME}"
 CREDENTIALS_PATH = Path.home() / ".raven" / "gmail_credentials.json"
 TOKEN_PATH = Path.home() / ".raven" / "gmail_token.json"
 SCOPES = [
@@ -29,7 +31,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
 ]
 MAX_BODY_CHARS = 4000
-
 _service = None
 
 
@@ -181,10 +182,19 @@ def _address(value: str) -> str:
 
 
 def _build_mime(to: str, subject: str, body: str) -> MIMEText:
+    if SIGNATURE not in body:
+        body = f"{body}\n\n{SIGNATURE}"
     mime = MIMEText(body)
     mime["to"] = _address(to)
     mime["subject"] = _clean(subject)
     return mime
+
+# old version
+# def _build_mime(to: str, subject: str, body: str) -> MIMEText:
+#     mime = MIMEText(body)
+#     mime["to"] = _address(to)
+#     mime["subject"] = _clean(subject)
+#     return mime
 
 
 def _send_mime(mime: MIMEText, label: str, thread_id: str | None = None) -> str:

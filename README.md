@@ -12,17 +12,144 @@ export OPENROUTER_API_KEY=your-key-here
 python -m raven.cli
 ```
 
+## Headless mode
+
+```bash
+raven -p "What is 2+2?"          # runs one request, prints the plain-text reply, exits
+raven -p "Delete old.log" -y     # -y auto-approves confirmation-gated tool calls
+```
+
+No TTY needed — for scripting, cron, or piping into other tools. Without
+`-y`, anything that would need your confirmation (`delete_file`,
+`run_command`, etc.) is denied by default, never silently approved just
+because no one's watching; the reply says so, and R.A.V.E.N exits normally.
+On an actual error, it prints the error and exits with status 1. History,
+settings, and `RAVEN.md` rules all work the same as interactive mode.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Runs in a few seconds, no network and no real model or account touched by
+default. Everything that needs those (a live OpenRouter call, a real Gmail
+account) is marked `live` and skipped unless you ask for it explicitly:
+
+```bash
+pytest -m live
+```
+
+## Project/user rules
+
+Drop a `RAVEN.md` in a project's root and R.A.V.E.N will load it into the
+system prompt on startup — coding standards, how to run tests, whatever the
+model should know about that project specifically. A `~/.raven/RAVEN.md`
+does the same thing globally, across every project. Both are optional; if
+present, R.A.V.E.N says so on startup ("Loaded rules from ..."). User rules
+come first, project rules last — closer to the actual task, so they win on
+anything the two disagree on. Each file is capped at ~4000 characters (same
+truncation convention as everything else in this project).
+
+## Code editing and search
+
+For working in a codebase: `tree` shows a directory's structure recursively
+(bounded depth/entry count, so it stays usable on a big project); `glob_files`
+finds files by name pattern (`**/*.py`); `grep` searches file contents by
+regex; `edit_file` makes a targeted change to part of an existing file
+instead of rewriting the whole thing with `write_file`. `edit_file` requires
+the text being replaced (`old_string`) to match **exactly once** in the
+file — no match, or more than one, and it refuses rather than guess which
+occurrence was meant; add more surrounding context to make it unique. Unlike
+`write_file` (which only confirms when overwriting something that already
+exists), `edit_file` always confirms, since it only ever touches an existing
+file — the confirmation shows exactly what's being replaced and with what.
+
+`run_tests` (default command: `pytest`) is a dedicated tool for running a
+project's actual test suite — same confirmation policy as `run_command`, but
+with a 120s timeout instead of 30s, since a real test suite (this project's
+own included) can legitimately take longer than a quick shell command.
+
+## Permissions
+
+By default, `run_command`/`run_tests` confirm unless the command is a plain
+call to a built-in read-only program (`ls`, `cat`, etc.), and `git` confirms
+unless the subcommand is `status`/`log`/`diff`/`show`. `~/.raven/settings.json`
+lets you extend that trust — additively, never in place of it:
+
+```json
+{
+  "permissions": {
+    "allow_commands": ["pytest"],
+    "allow_git": ["commit", "add"]
+  }
+}
+```
+
+`allow_commands` lets a plain, metacharacter-free call to that program skip
+confirmation too (via `run_command` or `run_tests`); `allow_git` does the
+same for a git subcommand. The shell-metacharacter check always still
+applies regardless: `"pytest; rm -rf ~"` still confirms even with `pytest`
+trusted — trusting a program name only ever exempts a plain call to exactly
+that program, never anything chained after it.
+
+## Hooks
+
+`~/.raven/settings.json` can also run a shell command automatically before
+and/or after a specific tool call — e.g. auto-formatting a file right after
+R.A.V.E.N edits it:
+
+```json
+{
+  "hooks": {
+    "post": {"edit_file": "black {path}"},
+    "pre": {"edit_file": "cp {path} {path}.bak"}
+  }
+}
+```
+
+`{placeholder}`s are filled in from that tool call's own arguments (`{path}`,
+or anything else the tool takes). Hooks never ask for confirmation — putting
+one in this file, which only you control, **is** the approval, the same
+trust boundary as `permissions` above. A `post` hook only runs if the tool
+call actually succeeded (not after `edit_file`'s own "not found" refusal,
+which changed nothing); a hook's own output or error is appended to the
+tool's result so you can see it happened. Scoped to the model's own
+tool-calling loop — manual `/write`, `/run`, etc. don't trigger hooks.
+
+## Skills (on-demand tools)
+
+Only file/shell/coding tools (`read_file`, `edit_file`, `grep`, `run_command`,
+`git`, `save_note`, etc.) are sent to the model on every request. Desktop app
+control, the web, R.A.V.E.N's own browser, and Gmail are
+grouped into named **skills** — `desktop`, `web`, `browser`, `gmail` — that
+the model unlocks itself with a `load_skill` call the moment a request
+actually needs one, then uses like any other tool for the rest of that
+session. This cut R.A.V.E.N's fixed per-request overhead (system prompt +
+every tool's spec, sent regardless of what a conversation is actually about)
+by roughly half — measured at ~5.6k tokens down to ~2.75k when no skill is
+loaded, since neither the unused tool specs nor their guardrail instructions
+(e.g. the Gmail Reply-To/untrusted-content guidance, the browser submit-safety
+rule) are paid for until they're relevant. Nothing about how a loaded skill's
+tools behave changes — same confirmation policy, same everything — this only
+affects when their specs and instructions actually reach the model. A fresh
+session always starts back at core-only; there's no persistence to manage.
+
 ## Structure
 
 ```
 raven/
-  llm_provider.py   # LLM interface + Provider (Openrouter) implementation
+  llm_provider.py   # LLM interface + Provider (Openrouter) implementation, RAVEN.md loading
   assistant.py       # conversation state, calls the provider
-  tools.py           # file I/O + shell primitives, tool specs
-  store.py           # SQLite persistence for conversation history
-  statusline.py      # bottom status-line segments
-  config.py          # env/config loading + settings.json
-  cli.py              # entry point, input/output loop
+  tools.py           # file I/O + shell/search primitives, tool specs
+  browser.py          # Playwright-backed browser session (own thread)
+  gmail.py            # Gmail OAuth, list/read/send/reply
+  store.py            # SQLite persistence for conversation history
+  statusline.py       # bottom status-line segments
+  config.py           # env/config loading + settings.json
+  cli.py               # entry point, input/output loop
+tests/                 # pytest suite — see "Tests" above
 ```
 
 ## Memory
@@ -36,6 +163,27 @@ treated as still true. R.A.V.E.N is told to re-check rather than trust a
 stale "X isn't available" from earlier in the conversation, but if it still
 seems to be working from old information, run `/forget` to clear history
 (in memory and on disk) and start fresh.
+
+Only a bounded window of recent history is actually sent to the model each
+request (see "Status line" below for the budget). Once a conversation grows
+past that, older turns aren't just dropped — they're summarized into a
+running summary that's sent in their place, so facts and decisions from
+earlier in a long conversation are still available, just compressed. This
+happens automatically whenever it's needed, or on demand with `/compact`.
+The summary itself is never written to disk — the full raw conversation in
+`~/.raven/history.db` is untouched either way, so nothing is ever actually
+lost, and a fresh session always starts from the real thing.
+
+Separately, R.A.V.E.N can save short, durable facts to
+`~/.raven/memory/notes.md` with its own `save_note` tool — a stated
+preference, a project convention, a correction — loaded into every future
+session automatically, so they survive `/forget` and outlive any single
+conversation. It decides on its own when something's worth remembering; it
+never needs confirmation, since it's an append-only, bounded write (one note
+capped at ~500 characters, the whole file at ~4000 — past that it refuses
+rather than silently truncating a fact or evicting an older one). `/notes`
+shows what's currently saved; the file is a plain markdown list you can edit
+or clear by hand at any time.
 
 ## Status line
 
@@ -52,9 +200,10 @@ The prompt shows a bottom status line. Segments and their order come from
 }
 ```
 
-Status-line segments: `model` (what actually answered), `context` (messages sent /
-cap), `tokens` (session total), `memory`, `cpu`. Add your own in
-`raven/statusline.py` — one function per segment.
+Status-line segments: `model` (what actually answered), `context` (approx.
+tokens of history sent to the model / the budget), `tokens` (session total),
+`memory`, `cpu`. Add your own in `raven/statusline.py` — one function per
+segment.
 
 Change it from inside R.A.V.E.N with `/statusline` (no args lists the segments;
 `/statusline model tokens cpu` sets and saves them).

@@ -1,2 +1,13 @@
 R.A.V.E.N: from a local companion to a real coding agent
 
+Role: Headless workspace coding engine (similar to Claude Code or Aider), codebase maintainer, and autonomous team collaborator for GemmaS and GOD2.
+
+Scope: Repository-wide code parsing, autonomous test-driven execution, pull request creation, automated code reviews, and shared technical documentation retrieval.
+
+Infrastructure: Centralized deployment (Docker container / self-hosted node or cloud API route) exposing an OpenAI-compatible API endpoint with a shared Vector Database (e.g., Qdrant / PostgreSQL pgvector).
+
+Model: 
+VPS:
+Cost in total
+
+Ability to switch model for specific tasks (phase 5)

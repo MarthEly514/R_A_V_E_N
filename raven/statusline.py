@@ -5,7 +5,7 @@ dropping it in SEGMENTS, then list its name in settings.json -> statusline.segme
 """
 import psutil
 
-from raven.assistant import MAX_CONTEXT_MESSAGES
+from raven.assistant import MAX_CONTEXT_CHARS
 
 SEP = "  •  "
 
@@ -16,9 +16,15 @@ def _model(provider, assistant) -> str:
     return name.split("/")[-1].replace(":free", "")
 
 
+def _fmt_tokens(n: int) -> str:
+    return f"{n // 1000}k" if n >= 1000 else str(n)
+
+
 def _context(provider, assistant) -> str:
-    """history messages sent to the model / cap"""
-    return f"ctx {assistant.context_len}/{MAX_CONTEXT_MESSAGES}"
+    """approx. tokens of history sent to the model / the budget"""
+    used = assistant.context_chars // 4  # chars/4 approximation, same as elsewhere in this project
+    budget = MAX_CONTEXT_CHARS // 4
+    return f"ctx ~{_fmt_tokens(used)}/{_fmt_tokens(budget)} tok"
 
 
 def _tokens(provider, assistant) -> str:

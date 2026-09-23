@@ -14,6 +14,7 @@ import requests
 
 from raven import browser as _browser
 from raven import gmail as _gmail
+from raven.config import NOTES_PATH
 
 APP_DIRS = [
     Path("/usr/share/applications"),
@@ -26,13 +27,35 @@ APP_DIRS = [
 
 _HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RAVEN-agent/1.0)"}
 
+# Same 4000-char convention already used by fetch_url/browser.read/gmail's body
+# (see MAX_READ_CHARS, MAX_BODY_CHARS) — applied here to the tools whose output
+# is otherwise genuinely unbounded (a big file, a build log, a huge directory).
+MAX_OUTPUT_CHARS = 4000
+
+
+def _truncate(text: str, max_chars: int = MAX_OUTPUT_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f" … (truncated, {len(text) - max_chars} more chars)"
+
 
 def resolve(path: str) -> Path:
     return Path(path).expanduser().resolve()
 
 
+def _is_existing_file(path: str) -> bool:
+    """Whether `path` resolves to an existing file — used to decide whether
+    write_file needs confirmation (creating a new file doesn't; overwriting
+    one does). Fails safe (True, i.e. "ask") on any error resolving the
+    path, rather than silently skipping confirmation."""
+    try:
+        return bool(path) and resolve(path).is_file()
+    except (OSError, ValueError):
+        return True
+
+
 def read_file(path: str) -> str:
-    return resolve(path).read_text()
+    return _truncate(resolve(path).read_text())
 
 
 def write_file(path: str, content: str = "") -> str:
@@ -45,9 +68,183 @@ def make_dir(path: str) -> str:
     return f"Created {path}"
 
 
+# save_note (B3): durable, cross-session memory — separate from conversation
+# history (which /forget wipes and A2/B2's budget trims/compacts) and from
+# RAVEN.md (user-authored instructions). Notes are model-written FACTS the
+# model chose to remember beyond this conversation, loaded into every future
+# session's system prompt (see llm_provider.load_notes).
+MAX_NOTE_CHARS = 500  # a single note is meant to be one concise fact, not an essay
+MAX_NOTES_FILE_CHARS = 4000  # same convention as RULES_MAX_CHARS — fixed per-request overhead
+
+
+def save_note(note: str) -> str:
+    """Append `note` as one line to ~/.raven/memory/notes.md, creating the
+    file/directory if needed. Refuses (doesn't silently truncate or evict
+    older notes) if the note itself is too long or the file is already at
+    its cap — a fact silently cut off or a still-relevant note silently
+    dropped would be worse than an explicit error the model can act on."""
+    note = note.strip()
+    if not note:
+        return "Error: empty note."
+    note = note.replace("\r", " ").replace("\n", " ")  # one note = one line, keeps the file greppable
+    if len(note) > MAX_NOTE_CHARS:
+        return f"Error: note too long ({len(note)} chars, max {MAX_NOTE_CHARS}). Keep it to one concise fact."
+    NOTES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    existing = NOTES_PATH.read_text() if NOTES_PATH.exists() else ""
+    line = f"- {note}\n"
+    if len(existing) + len(line) > MAX_NOTES_FILE_CHARS:
+        return (f"Error: memory is full ({MAX_NOTES_FILE_CHARS}-char cap). "
+                f"Ask the user before removing old notes to make room.")
+    NOTES_PATH.write_text(existing + line)
+    return f"Saved note: {note}"
+
+
 def list_dir(path: str = ".") -> str:
     entries = sorted(resolve(path).iterdir())
-    return "\n".join(f"{'d' if e.is_dir() else '-'} {e.name}" for e in entries) or "(empty)"
+    return _truncate("\n".join(f"{'d' if e.is_dir() else '-'} {e.name}" for e in entries) or "(empty)")
+
+
+def edit_file(path: str, old_string: str, new_string: str) -> str:
+    """Replace an EXACT, UNIQUE occurrence of old_string with new_string in
+    the file at path (C1) -- targeted edits without rewriting a whole file
+    through write_file. Refuses (no write happens) if old_string isn't found
+    or is found more than once: an ambiguous target could silently edit the
+    wrong spot, so the caller has to supply enough surrounding context to
+    pin down exactly one location, same semantics as Claude Code's own edit
+    tool. Always requires confirmation (see assistant._confirm_prompt) --
+    like write_file's overwrite case, this only ever touches a file that
+    already exists."""
+    if not old_string:
+        return "Error: old_string must not be empty."
+    file = resolve(path)
+    content = file.read_text()
+    count = content.count(old_string)
+    if count == 0:
+        return f"Error: old_string not found in {path}."
+    if count > 1:
+        return f"Error: old_string matches {count} times in {path} -- include more context to make it unique."
+    file.write_text(content.replace(old_string, new_string, 1))
+    return f"Edited {path}"
+
+
+# glob_files / tree (C1): read-only navigation/search tools, same skip-dirs
+# and result-cap conventions as grep so a huge or deep tree can't produce
+# unbounded output.
+MAX_GLOB_RESULTS = 200
+MAX_TREE_ENTRIES = 500
+
+
+def glob_files(pattern: str, path: str = ".") -> str:
+    """Find files under `path` matching a glob pattern (e.g. "**/*.py"),
+    one relative path per line. Read-only, no shell involved -- same
+    rationale as grep for never needing confirmation."""
+    base = resolve(path)
+    if not base.is_dir():
+        return f"Not a directory: {path}"
+    results = []
+    for file in sorted(base.glob(pattern)):
+        if not file.is_file() or any(part in _GREP_SKIP_DIRS for part in file.relative_to(base).parts):
+            continue
+        results.append(str(file.relative_to(base)))
+        if len(results) >= MAX_GLOB_RESULTS:
+            break
+    if not results:
+        return f"No files matching '{pattern}' in {path}."
+    result = "\n".join(results)
+    if len(results) >= MAX_GLOB_RESULTS:
+        result += f"\n… (stopped at {MAX_GLOB_RESULTS} results — narrow the pattern)"
+    return _truncate(result)
+
+
+def tree(path: str = ".", max_depth: int = 3) -> str:
+    """Recursive directory listing (d = dir, - = file), indented by depth,
+    skipping the same heavy directories grep does, bounded to max_depth
+    levels and MAX_TREE_ENTRIES total entries."""
+    base = resolve(path)
+    if not base.is_dir():
+        return f"Not a directory: {path}"
+    lines: list[str] = []
+
+    def walk(dir_path: Path, depth: int) -> None:
+        if len(lines) >= MAX_TREE_ENTRIES:
+            return
+        try:
+            entries = sorted(dir_path.iterdir(), key=lambda p: (p.is_file(), p.name))
+        except OSError:
+            return
+        for entry in entries:
+            if len(lines) >= MAX_TREE_ENTRIES:
+                return
+            if entry.name in _GREP_SKIP_DIRS:
+                continue
+            lines.append(f"{'  ' * depth}{'d' if entry.is_dir() else '-'} {entry.name}")
+            if entry.is_dir() and depth < max_depth:
+                walk(entry, depth + 1)
+
+    walk(base, 0)
+    result = "\n".join(lines) or "(empty)"
+    if len(lines) >= MAX_TREE_ENTRIES:
+        result += f"\n… (stopped at {MAX_TREE_ENTRIES} entries — narrow the path or depth)"
+    return _truncate(result)
+
+
+# grep: directories skipped outright (heavy, rarely what a code search wants),
+# and a total-files-scanned cap as a second safety net beyond the match cap,
+# so a rare pattern over a huge unfiltered tree can't turn into a slow scan.
+_GREP_SKIP_DIRS = {".git", "venv", "node_modules", "__pycache__", ".pytest_cache",
+                    "raven.egg-info", "dist", "build", ".mypy_cache", ".ruff_cache"}
+MAX_GREP_MATCHES = 50
+MAX_GREP_FILES_SCANNED = 5000
+
+
+def _looks_binary(path: Path) -> bool:
+    """Same heuristic grep/git use: a NUL byte in the first KB means binary."""
+    try:
+        with path.open("rb") as f:
+            return b"\0" in f.read(1024)
+    except OSError:
+        return True  # unreadable -> skip rather than guess
+
+
+def grep(pattern: str, path: str = ".", glob: str = "**/*") -> str:
+    """Search text files under `path` for lines matching a regex `pattern`
+    (case-insensitive), narrowed by `glob` (e.g. "**/*.py"). Read-only —
+    doesn't shell out, so unlike routing this through run_command there's no
+    injection surface to guard, hence no confirmation needed."""
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        return f"Invalid pattern: {e}"
+    base = resolve(path)
+    if not base.is_dir():
+        return f"Not a directory: {path}"
+    matches = []
+    scanned = 0
+    for file in sorted(base.glob(glob)):
+        if not file.is_file() or any(part in _GREP_SKIP_DIRS for part in file.relative_to(base).parts):
+            continue
+        scanned += 1
+        if scanned > MAX_GREP_FILES_SCANNED:
+            break
+        if _looks_binary(file):
+            continue
+        try:
+            text = file.read_text(errors="ignore")
+        except OSError:
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if regex.search(line):
+                matches.append(f"{file.relative_to(base)}:{lineno}: {line.strip()}")
+                if len(matches) >= MAX_GREP_MATCHES:
+                    break
+        if len(matches) >= MAX_GREP_MATCHES:
+            break
+    if not matches:
+        return f"No matches for '{pattern}' in {path}."
+    result = "\n".join(matches)
+    if len(matches) >= MAX_GREP_MATCHES:
+        result += f"\n… (stopped at {MAX_GREP_MATCHES} matches — narrow the pattern or glob)"
+    return _truncate(result)
 
 
 def delete_file(path: str) -> str:
@@ -55,10 +252,33 @@ def delete_file(path: str) -> str:
     return f"Deleted {path}"
 
 
-def run_command(command: str) -> str:
-    result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+RUN_COMMAND_TIMEOUT = 30
+# C3: a real test suite (this project's own included, once its live/playwright
+# tests are counted) routinely runs longer than a quick shell command --
+# run_tests gets its own, generously longer timeout rather than forcing every
+# run_command call to wait that long just to accommodate the rare slow case.
+RUN_TESTS_TIMEOUT = 120
+
+
+def _run_shell(command: str, timeout: int) -> str:
+    result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
     output = result.stdout + result.stderr
-    return output.strip() or f"(exited {result.returncode}, no output)"
+    return _truncate(output.strip()) or f"(exited {result.returncode}, no output)"
+
+
+def run_command(command: str) -> str:
+    return _run_shell(command, RUN_COMMAND_TIMEOUT)
+
+
+def run_tests(command: str = "pytest") -> str:
+    """Like run_command, but with a longer timeout for a real test suite and
+    a distinct tool identity so the model reaches for this instead of being
+    tempted to squeeze a slow test run through run_command's 30s cap.
+    Confirmation policy is identical to run_command's (see
+    assistant._confirm_prompt) -- settings.json's permissions.allow_commands
+    (C3) is what lets a project's test command skip confirmation, e.g.
+    {"allow_commands": ["pytest"]}."""
+    return _run_shell(command, RUN_TESTS_TIMEOUT)
 
 
 def git(args: str = "status") -> str:
@@ -395,9 +615,15 @@ TOOL_FUNCTIONS = {
     "read_file": read_file,
     "write_file": write_file,
     "make_dir": make_dir,
+    "save_note": save_note,
     "list_dir": list_dir,
+    "edit_file": edit_file,
+    "glob_files": glob_files,
+    "tree": tree,
+    "grep": grep,
     "delete_file": delete_file,
     "run_command": run_command,
+    "run_tests": run_tests,
     "git": git,
     "open_app": open_app,
     "open_file": open_file,
@@ -423,14 +649,16 @@ TOOL_FUNCTIONS = {
 TOOL_SPECS = [
     {"type": "function", "function": {
         "name": "read_file",
-        "description": "Read and return the contents of a text file.",
+        "description": "Read and return the contents of a text file, truncated to ~4000 characters "
+                       "for a large file (a truncation marker says how much was cut).",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Path to the file"}},
             "required": ["path"]},
     }},
     {"type": "function", "function": {
         "name": "write_file",
-        "description": "Write (or overwrite) a text file with the given content.",
+        "description": "Write a text file with the given content. Requires user confirmation if "
+                       "the file already exists (overwriting it) — not if it's new.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Path to the file"},
             "content": {"type": "string", "description": "Content to write"}},
@@ -444,10 +672,73 @@ TOOL_SPECS = [
             "required": ["path"]},
     }},
     {"type": "function", "function": {
+        "name": "save_note",
+        "description": "Save one concise fact to durable, cross-session memory (max ~500 "
+                       "characters) — use this for something worth remembering beyond this "
+                       "conversation (a user preference, a project convention, a correction), "
+                       "not for routine conversation content. Loaded automatically at the start "
+                       "of every future session. Never needs confirmation. Refuses if the note "
+                       "is too long or memory is already full, rather than silently truncating.",
+        "parameters": {"type": "object", "properties": {
+            "note": {"type": "string", "description": "The fact to remember, as one concise sentence"}},
+            "required": ["note"]},
+    }},
+    {"type": "function", "function": {
         "name": "list_dir",
-        "description": "List the entries of a directory (d = dir, - = file).",
+        "description": "List the entries of a directory (d = dir, - = file), truncated to ~4000 "
+                       "characters for a very large directory.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Directory path (default: current dir)"}}},
+    }},
+    {"type": "function", "function": {
+        "name": "edit_file",
+        "description": "Replace an exact, UNIQUE occurrence of old_string with new_string in an "
+                       "existing file. Prefer this over write_file for a targeted change to part "
+                       "of a file — it fails safely if old_string isn't found, or matches more "
+                       "than once (add more surrounding context to make it unique). Always "
+                       "requires user confirmation, since it only ever edits an existing file.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Path to the file"},
+            "old_string": {"type": "string", "description": "Exact text to replace (must match exactly once)"},
+            "new_string": {"type": "string", "description": "Text to replace it with"}},
+            "required": ["path", "old_string", "new_string"]},
+    }},
+    {"type": "function", "function": {
+        "name": "glob_files",
+        "description": "Find files under a directory matching a glob pattern (e.g. \"**/*.py\"), "
+                       "one relative path per line — use this to locate files by name/extension "
+                       "rather than content (for content, use grep). Read-only, never needs "
+                       "confirmation. Common directories (.git, venv, node_modules, etc.) are "
+                       "skipped automatically; results capped at 200 — narrow the pattern if you hit that.",
+        "parameters": {"type": "object", "properties": {
+            "pattern": {"type": "string", "description": "Glob pattern, e.g. '**/*.py'"},
+            "path": {"type": "string", "description": "Directory to search under (default: current dir)"}},
+            "required": ["pattern"]},
+    }},
+    {"type": "function", "function": {
+        "name": "tree",
+        "description": "Show a directory's structure recursively (d = dir, - = file), indented by "
+                       "depth — use this to get oriented in an unfamiliar project instead of "
+                       "repeated list_dir calls. Bounded to 3 levels deep by default and 500 total "
+                       "entries; common heavy directories are skipped automatically.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Directory path (default: current dir)"},
+            "max_depth": {"type": "integer", "description": "How many levels deep to recurse (default: 3)"}}},
+    }},
+    {"type": "function", "function": {
+        "name": "grep",
+        "description": "Search text files for lines matching a regex pattern (case-insensitive), "
+                       "e.g. to find where something is defined or used in a codebase. Prefer "
+                       "this over run_command with grep/find — this one never needs confirmation, "
+                       "since it's read-only and doesn't run a shell command. Common directories "
+                       "(.git, venv, node_modules, __pycache__, etc.) are skipped automatically; "
+                       "results capped at 50 matches — narrow the pattern or glob if you hit that.",
+        "parameters": {"type": "object", "properties": {
+            "pattern": {"type": "string", "description": "Regex to search for"},
+            "path": {"type": "string", "description": "Directory to search under (default: current dir)"},
+            "glob": {"type": "string", "description": "Glob to narrow which files are searched, "
+                                                        "e.g. '**/*.py' (default: all files)"}},
+            "required": ["pattern"]},
     }},
     {"type": "function", "function": {
         "name": "delete_file",
@@ -458,13 +749,23 @@ TOOL_SPECS = [
     }},
     {"type": "function", "function": {
         "name": "run_command",
-        "description": "Run a shell command and return its output. Requires user confirmation, "
-                       "except for a plain (no chaining/redirection) call to a read-only command "
-                       "like ls, cat, ps, pwd, wc, head, tail, which, id, date, uname, df, du, "
-                       "hostname, free, uptime, whoami, or echo, which runs immediately.",
+        "description": "Run a shell command and return its output, truncated to ~4000 characters "
+                       "for a very long output. Requires user confirmation, except for a plain "
+                       "(no chaining/redirection) call to a read-only command like ls, cat, ps, "
+                       "pwd, wc, head, tail, which, id, date, uname, df, du, hostname, free, "
+                       "uptime, whoami, or echo, which runs immediately.",
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string", "description": "Shell command to run"}},
             "required": ["command"]},
+    }},
+    {"type": "function", "function": {
+        "name": "run_tests",
+        "description": "Run a test command (default: 'pytest') with a longer timeout (120s) than "
+                       "run_command's 30s, for a real test suite. Prefer this over run_command "
+                       "whenever the goal is specifically running tests. Same confirmation policy "
+                       "as run_command — asks unless the command is on the user's trusted list.",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string", "description": "Test command to run (default: 'pytest')"}}},
     }},
     {"type": "function", "function": {
         "name": "git",
@@ -661,4 +962,36 @@ TOOL_SPECS = [
             "required": ["message_id", "body"]},
     }},
 ]
+
+
+# D2: tool-spec grouping so only "core" (file I/O, search, shell, coding,
+# save_note) is sent on every request; everything else is a named skill
+# loaded on demand via Assistant.load_skill (see LOAD_SKILL_SPEC there),
+# to cut the fixed per-request tool-spec overhead this project measured at
+# ~2.9k tokens for all specs (DEV_LOG, 2026-09-21) down to just what a given
+# conversation actually uses. Lives here, not in assistant.py, since it's
+# purely a grouping of THIS module's own tool names/specs.
+SKILLS = {
+    "desktop": ["open_app", "open_file", "close_app", "list_windows", "close_window", "list_apps"],
+    "web": ["open_url", "fetch_url", "web_search"],
+    "browser": ["browser_navigate", "browser_read", "browser_click", "browser_type",
+                "browser_submit", "browser_close"],
+    "gmail": ["gmail_list_messages", "gmail_read_message", "gmail_send_message", "gmail_reply_message"],
+}
+SKILL_DESCRIPTIONS = {
+    "desktop": "open/close desktop applications and windows",
+    "web": "open a URL, fetch a page's text, search the web",
+    "browser": "navigate/read/click/type/submit in a real, interactive browser session",
+    "gmail": "read, send, and reply to the user's Gmail",
+}
+
+
+def core_tool_names() -> set[str]:
+    """Every registered tool NOT grouped into a skill above -- the
+    always-sent baseline. A tool added to TOOL_FUNCTIONS without being added
+    to SKILLS defaults to core (always available) -- the safe direction to
+    fail in, since forgetting to categorize a new tool makes it always-on,
+    never silently unreachable."""
+    skill_tools = {name for names in SKILLS.values() for name in names}
+    return set(TOOL_FUNCTIONS) - skill_tools
 
