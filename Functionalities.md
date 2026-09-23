@@ -60,9 +60,16 @@ shared with interactive mode; a real error prints and exits with status 1.
 
 ### While it works and after it replies
 
-- **Live activity line.** The spinner shows what the agent is doing right now
-  ("Reading x.txt...", "Searching the web for ...", "Opening figma.com in
-  Firefox...") and changes as it moves between tool calls.
+- **Live activity line.** A custom animated spinner alongside status text
+  that shows what the agent is doing right now ("Reading x.txt...",
+  "Searching the web for ...", "Opening figma.com in Firefox..."), changing
+  as it moves between tool calls. While waiting on the model with no tool
+  running, the text instead rotates through a set of idle words every 5s,
+  each rendered with a brightness "shimmer" sweeping across it. The moment a
+  tool call starts, that rotation pauses — a tool's own status sticks until
+  either another tool call replaces it or the turn ends, rather than being
+  overwritten by the next random word up to 5s later (a real bug, fixed
+  2026-09-23).
 - **"Thought for X.Xs".** Printed after each successful reply, with a hint to
   press `Ctrl+O` when the model supplied a reasoning trace. Skipped when the
   request was cancelled or errored.

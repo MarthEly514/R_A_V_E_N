@@ -194,6 +194,33 @@ class Assistant:
         user_turns = [i for i, m in enumerate(self.history) if m.get("role") == "user"]
         return next((i for i in user_turns if i >= cutoff), user_turns[-1] if user_turns else 0)
 
+    def _context_preview(self) -> list[dict]:
+        """Same shape as _context(), for READ-ONLY/informational use (the
+        status line's context_len/context_chars) -- never triggers a fresh
+        compaction call. _context() is the only method allowed to do that,
+        since it's the real per-turn request path, already covered by the
+        "thinking" spinner in interactive mode. This one only reuses a
+        summary that's ALREADY cached; if the boundary has advanced past
+        what's cached, it falls back to the plain (uncompacted) tail rather
+        than block a passive read on a real network call -- a bug found
+        live 2026-09-23: the status line re-evaluates this on every toolbar
+        refresh, including the very first one before any message is sent,
+        so a history that already exceeded the budget from a PRIOR session
+        made simply opening R.A.V.E.N silently block for as long as a real
+        OpenRouter call takes, with no spinner, before the prompt would
+        accept any input. The tradeoff this accepts: the status line can
+        show a stale (larger, pre-compaction) size until the next real ask()
+        actually compacts -- cosmetic, and far better than blocking the UI."""
+        start = self._drop_boundary()
+        messages = self.history[start:]
+        if start == 0 or start > self._compacted_through or not self._compacted_summary:
+            return messages
+        summary_msg = {
+            "role": "user",
+            "content": f"[Summary of {start} earlier messages, replaced here to stay within budget]\n{self._compacted_summary}",
+        }
+        return [summary_msg, *messages]
+
     def _compact(self, through: int) -> str | None:
         """Ensure self._compacted_summary covers self.history[:through],
         extending the cached summary incrementally if more history has fallen
@@ -249,14 +276,18 @@ class Assistant:
 
     @property
     def context_len(self) -> int:
-        """Number of history messages currently sent to the model per request."""
-        return len(self._context())
+        """Number of history messages currently sent to the model per
+        request. Uses _context_preview(), not _context() -- see its
+        docstring for why (must never trigger a real network call just to
+        answer a status-line query)."""
+        return len(self._context_preview())
 
     @property
     def context_chars(self) -> int:
         """Approximate size, in characters, of what's currently sent to the
-        model per request (see MAX_CONTEXT_CHARS)."""
-        return sum(len(json.dumps(m)) for m in self._context())
+        model per request (see MAX_CONTEXT_CHARS). Same _context_preview()
+        caveat as context_len."""
+        return sum(len(json.dumps(m)) for m in self._context_preview())
 
     def _persist(self) -> None:
         if self.store and len(self.history) > self._persisted:

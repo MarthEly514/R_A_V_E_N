@@ -4,6 +4,7 @@ Excludes main()/PromptSession/the input loop, which need a real TTY. Every
 function here is pure or takes its dependencies (status, console) as
 parameters/mocks.
 """
+import time
 from unittest.mock import patch
 
 import pytest
@@ -128,6 +129,85 @@ def test_confirm_run_with_no_status_still_works():
     with patch.object(cli, "Confirm") as mock_confirm:
         mock_confirm.ask.return_value = False
         assert cli.confirm_run("x", None) is False
+
+
+# ---------------------------------------------------------------------------
+# shimmer_text: pure rendering helper, no timing state (2026-09-23 esthetic patch)
+# ---------------------------------------------------------------------------
+
+def test_shimmer_text_empty_word_is_empty():
+    assert cli.shimmer_text("", 0) == ""
+
+
+def test_shimmer_text_contains_every_character_of_the_word():
+    out = cli.shimmer_text("Thinking...", 3)
+    for ch in "Thinking...":
+        assert ch in out
+
+
+def test_shimmer_text_changes_across_frames():
+    """The whole point: it's an animation, so consecutive frames must render
+    differently (the highlight position moves)."""
+    word = "Thinking..."
+    frames = {cli.shimmer_text(word, f) for f in range(len(word) + len(cli._SHIMMER_STYLES))}
+    assert len(frames) > 1
+
+
+def test_shimmer_text_loops():
+    """After a full sweep (word length + gradient width), the pattern must
+    repeat exactly, not drift or grow unbounded markup."""
+    word = "Thinking..."
+    period = len(word) + len(cli._SHIMMER_STYLES)
+    assert cli.shimmer_text(word, 2) == cli.shimmer_text(word, 2 + period)
+
+
+# ---------------------------------------------------------------------------
+# schedule_word_rotation: the pause bug fix (2026-09-23) — a tool-call status
+# must not be stomped by the next random word up to `interval` seconds later.
+# ---------------------------------------------------------------------------
+
+class FakeStatusRecorder:
+    def __init__(self):
+        self.updates = []
+
+    def update(self, text):
+        self.updates.append(text)
+
+
+def test_rotation_updates_the_status_before_any_pause():
+    status = FakeStatusRecorder()
+    stop, pause = cli.schedule_word_rotation(status, ["Thinking..."], interval=0.05, shimmer_interval=0.02)
+    try:
+        time.sleep(0.1)
+        assert len(status.updates) > 0
+    finally:
+        stop()
+
+
+def test_pause_stops_further_updates():
+    status = FakeStatusRecorder()
+    stop, pause = cli.schedule_word_rotation(status, ["Thinking..."], interval=0.03, shimmer_interval=0.02)
+    try:
+        time.sleep(0.08)
+        pause()
+        count_at_pause = len(status.updates)
+        # Simulate a tool call setting its own status directly, the way
+        # on_tool_call does in main() -- this must survive untouched.
+        status.update("[dim]Reading file.py... (Ctrl+C to cancel)[/]")
+        time.sleep(0.15)  # well past several would-be rotation/shimmer ticks
+        assert status.updates[-1] == "[dim]Reading file.py... (Ctrl+C to cancel)[/]"
+        assert len(status.updates) == count_at_pause + 1  # nothing else snuck in
+    finally:
+        stop()
+
+
+def test_stop_cancels_all_timers():
+    status = FakeStatusRecorder()
+    stop, pause = cli.schedule_word_rotation(status, ["Thinking..."], interval=0.03, shimmer_interval=0.02)
+    stop()
+    count_at_stop = len(status.updates)
+    time.sleep(0.1)
+    assert len(status.updates) == count_at_stop
 
 
 # ---------------------------------------------------------------------------

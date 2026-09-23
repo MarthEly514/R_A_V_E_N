@@ -2,9 +2,11 @@
 import argparse
 
 import psutil
+import threading
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.status import Status
+from rich._spinners import SPINNERS
 from rich.table import Table
 from rich.prompt import Confirm
 from prompt_toolkit import PromptSession
@@ -45,14 +47,46 @@ THINKING_WORDS = [
     "Working on it...",
     "Thinking...",
     "Raveing...",
-    "Swimming...", 
-    "Calculating...", 
-    "Casting...", 
-    "Mogging...", 
-    "Smoking...", 
+    "Swimming...",
+    "Calculating...",
+    "Casting...",
+    "Mogging...",
+    "Smoking...",
     "Pasting...",
     ""
 ]
+
+# A small custom Rich spinner (registered into rich.spinner.SPINNERS, the
+# same dict Rich's own built-ins live in) so the thinking status shows a
+# distinct animated glyph rather than the generic default. Plain rounded-arc
+# unicode, not an emoji — matches the assistant's own no-emoji, calm-and-
+# professional tone (that rule is about the model's OWN text; this is just a
+# stylistic choice for consistency, not an enforcement of it).
+# SPINNERS["raven"] = {"interval": 120, "frames": ["◜", "◠", "◝", "◞", "◡", "◟"]}
+# SPINNERS["dots3"]
+
+# Shimmer effect (esthetic patch, 2026-09-23): a brightness peak sweeps left
+# to right across the thinking word, looping. Purely a rendering helper —
+# takes a word and a frame counter, returns Rich markup; has no timing state
+# of its own so it's trivially testable frame by frame.
+_SHIMMER_STYLES = ["grey42", "grey58", "grey74", "white", "bold white", "grey74", "grey58", "grey42"]
+
+
+def shimmer_text(word: str, frame: int) -> str:
+    """Render `word` with a bright highlight sweeping across it, `frame`
+    steps in — a window of _SHIMMER_STYLES centered on a position that
+    advances one character per frame and wraps once it's swept past the
+    whole word (word length + gradient width, so the shine fully exits
+    before looping back to the start)."""
+    if not word:
+        return ""
+    peak = frame % (len(word) + len(_SHIMMER_STYLES))
+    out = []
+    for i, ch in enumerate(word):
+        offset = peak - i
+        style = _SHIMMER_STYLES[offset] if 0 <= offset < len(_SHIMMER_STYLES) else "dim"
+        out.append(f"[{style}]{ch}[/{style}]")
+    return "".join(out)
 
 # What to show in the status line while a given tool is running. Add an entry
 # here whenever a new tool is added to tools.py (e.g. a future web-search tool).
@@ -349,6 +383,83 @@ def run_headless(prompt: str, auto_confirm: bool = False) -> None:
         print(f"I ran into an error: {e}")
         raise SystemExit(1)
     print(reply)
+    
+def schedule_word_rotation(status, words, interval=5.0, shimmer_interval=0.12):
+    """Drives the "thinking" status while waiting on the model: a random
+    word from `words` every `interval` seconds, with a shimmer sweep
+    animated across it every `shimmer_interval` seconds in between.
+
+    Returns (stop, pause). stop() cancels everything. pause() freezes the
+    rotation/shimmer in place WITHOUT cancelling the timer chain — this is
+    the fix for the tool-status-getting-overwritten bug: Assistant.on_tool_call
+    replaces the status text with what a running tool is doing, but the timers
+    here kept firing on their own schedule and stomping it with a random word
+    up to `interval` seconds later. main() calls pause() from on_tool_call, so
+    once a tool call happens, the rotation stops touching the status for the
+    rest of this turn and the tool's own text (set directly via status.update,
+    not through this function) sticks until the turn ends or another tool
+    call replaces it."""
+    stopped = {"flag": False}
+    paused = {"flag": False}
+    state = {"word_idx": -1, "frame": 0}
+    timers = []
+
+    def pick_word():
+        idx = randint(0, len(words) - 1)
+        while idx == state["word_idx"] and len(words) > 1:
+            idx = randint(0, len(words) - 1)
+        state["word_idx"] = idx
+        state["frame"] = 0
+
+    def render():
+        word = words[state["word_idx"]]
+        text = shimmer_text(word, state["frame"]) if word else ""
+        try:
+            status.update(f"{text} [dim](Ctrl+C to cancel)[/]" if text else "[dim](Ctrl+C to cancel)[/]")
+        except Exception:
+            pass
+
+    def word_tick():
+        if stopped["flag"]:
+            return
+        if not paused["flag"]:
+            pick_word()
+            render()
+        t = threading.Timer(interval, word_tick)
+        t.daemon = True
+        t.start()
+        timers.append(t)
+
+    def shimmer_tick():
+        if stopped["flag"]:
+            return
+        if not paused["flag"]:
+            state["frame"] += 1
+            render()
+        t = threading.Timer(shimmer_interval, shimmer_tick)
+        t.daemon = True
+        t.start()
+        timers.append(t)
+
+    pick_word()
+    t1 = threading.Timer(interval, word_tick)
+    t1.daemon = True
+    t1.start()
+    timers.append(t1)
+    t2 = threading.Timer(shimmer_interval, shimmer_tick)
+    t2.daemon = True
+    t2.start()
+    timers.append(t2)
+
+    def stop():
+        stopped["flag"] = True
+        for timer in timers:
+            timer.cancel()
+
+    def pause():
+        paused["flag"] = True
+
+    return stop, pause
 
 
 def main():
@@ -400,21 +511,33 @@ def main():
             COMMANDS[command](args)
             continue
 
-        with Status(f"[dim]{THINKING_WORDS[randint(0, len(THINKING_WORDS)-1)]} (Ctrl+C to cancel)[/]", console=console) as status:
-            assistant.on_tool_call = lambda name, args: status.update(
-                f"[dim]{tool_status_text(name, args)} (Ctrl+C to cancel)[/]"
-            )
+        initial_word = THINKING_WORDS[randint(0, len(THINKING_WORDS) - 1)]
+
+        with Status(f"[dim]{initial_word} (Ctrl+C to cancel)[/]", console=console, spinner="dots3") as status:
+            stop_rotation, pause_rotation = schedule_word_rotation(status, THINKING_WORDS, interval=5.0)
+
+            def on_tool_call(name, args):
+                # Pause first: a tool is now running, so the rotation must
+                # stop overwriting this with a random "thinking" word — the
+                # bug this whole change fixes (previously the rotation timer
+                # could stomp this update up to 5s later, mid-tool-run).
+                pause_rotation()
+                status.update(f"[dim]{tool_status_text(name, args)} (Ctrl+C to cancel)[/]")
+
+            assistant.on_tool_call = on_tool_call
             assistant.confirm_run = lambda action: confirm_run(action, status)
             thought_ok = True
             try:
                 reply = assistant.ask(user_input)
             except KeyboardInterrupt:
                 console.print("\n[dim]Cancelled.[/dim]\n")
+                stop_rotation()
                 continue
-
             except Exception as e:
                 reply = f"I ran into an error: {e}"
                 thought_ok = False
+            finally:
+                stop_rotation()
 
         if thought_ok:
             render_thought_line(assistant.last_elapsed, bool(assistant.last_reasoning))

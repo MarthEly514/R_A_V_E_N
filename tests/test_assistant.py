@@ -467,6 +467,64 @@ def test_compact_nothing_to_do_when_history_fits():
     assert "Nothing to compact" in a.compact()
 
 
+# ---------------------------------------------------------------------------
+# _context_preview() / context_chars / context_len (fixed 2026-09-23): must
+# NEVER trigger a real compaction call -- that's the whole bug. Found live:
+# the status line calls context_chars on every toolbar refresh, including
+# the very first one before any message is sent, so an oversized history
+# carried over from a prior session made simply opening R.A.V.E.N block for
+# as long as a real OpenRouter call takes, with no spinner, before the
+# prompt would even accept input.
+# ---------------------------------------------------------------------------
+
+def test_context_chars_never_calls_the_provider_even_when_over_budget():
+    provider = SummarizingProvider()
+    a = Assistant(provider)
+    a.history = _big_history()  # comfortably exceeds the budget
+    _ = a.context_chars
+    _ = a.context_len
+    assert provider.calls == []  # the actual regression check
+
+
+def test_context_preview_falls_back_to_the_plain_tail_before_anything_is_compacted():
+    a = Assistant(SummarizingProvider())
+    a.history = _big_history()
+    preview = a._context_preview()
+    assert preview[0]["role"] == "user"
+    assert not any("Summary" in str(m.get("content")) for m in preview)
+    assert preview == a.history[a._drop_boundary():]
+
+
+def test_context_preview_uses_the_summary_once_a_real_turn_has_cached_one():
+    """After a REAL _context() call (e.g. from an actual ask()) has cached a
+    summary, the preview should reflect it -- it just can't be the one to
+    CREATE that summary in the first place."""
+    provider = SummarizingProvider("the gist")
+    a = Assistant(provider)
+    a.history = _big_history()
+    a._context()  # the real, triggering call
+    assert len(provider.calls) == 1
+    preview = a._context_preview()
+    assert "the gist" in preview[0]["content"]
+    assert len(provider.calls) == 1  # preview reused the cache, didn't call again
+
+
+def test_context_preview_does_not_force_a_call_when_the_boundary_has_advanced_further():
+    """If more history has aged out since the last real compaction, the
+    preview must still not trigger a fresh call -- it just shows the older,
+    now-stale cached summary or the plain tail, whichever _drop_boundary
+    indicates, without ever blocking on the model."""
+    provider = SummarizingProvider("first gist")
+    a = Assistant(provider)
+    a.history = _big_history(turns=8)
+    a._context()
+    assert len(provider.calls) == 1
+    a.history += _big_history(turns=8)  # boundary advances past what's cached
+    _ = a.context_chars
+    _ = a.context_len
+    assert len(provider.calls) == 1  # still no second call from the preview path
+
+
 def test_compact_reports_success_and_is_idempotent():
     provider = SummarizingProvider("gist")
     a = Assistant(provider)
