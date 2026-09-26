@@ -1,0 +1,80 @@
+@import 'tailwindcss';
+
+/* Design tokens (UI_Model.jpg direction: flat, monochrome, thin lines, one dark accent).
+   Each becomes utilities: bg-ink, text-ink-dim, border-line, bg-panel, text-danger ... */
+@theme {
+  --color-ink: #05080f;
+  --color-ink-dim: #5b616b;
+  --color-line: rgb(5 8 15 / 0.35);
+  --color-line-soft: rgb(5 8 15 / 0.15);
+  --color-panel: rgb(255 255 255 / 0.35);
+  --color-danger: #8a1c1c;
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background: linear-gradient(to bottom, #bcbec3 0%, #bcbec3 35%, #8d959e 100%);
+    color: var(--color-ink);
+    overflow: hidden; /* the app owns its own scroll regions, not the window */
+  }
+}
+
+/* Markdown rendered by react-markdown: the elements come from the parser, so they
+ can't carry utility classes -- style them once here, still with Tailwind's @apply.
+   Deliberately NOT in @layer: unlayered rules beat highlight.js's own (unlayered) theme CSS,
+   so `pre code.hljs` can drop that theme's extra background/padding. */
+.markdown > :first-child {
+  @apply mt-0;
+}
+.markdown > :last-child {
+  @apply mb-0;
+}
+.markdown p,
+.markdown ul,
+.markdown ol {
+  @apply my-2;
+}
+.markdown ul {
+  @apply list-disc pl-5;
+}
+.markdown ol {
+  @apply list-decimal pl-5;
+}
+.markdown h1,
+.markdown h2,
+.markdown h3 {
+  @apply mt-3.5 mb-1 text-base font-semibold;
+}
+.markdown code {
+  @apply rounded-none bg-ink/10 px-1 py-0.5 font-mono text-[0.85em];
+}
+.markdown pre {
+  @apply my-2.5 overflow-x-auto bg-ink px-3.5 py-3 text-white;
+}
+.markdown pre code,
+.markdown pre code.hljs {
+  @apply bg-transparent p-0 text-inherit;
+}
+.markdown table {
+  @apply border-collapse text-[0.85rem];
+}
+.markdown th,
+.markdown td {
+  @apply border border-line px-2.5 py-1;
+}
+.markdown a {
+  @apply text-ink underline;
+}
+
+.noScrollbar::-webkit-scrollbar {
+  appearance: none;
+}

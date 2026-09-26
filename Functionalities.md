@@ -34,7 +34,7 @@ suggests them as you type `/`.
 | `/mkdir <path>` | Create a directory | no |
 | `/run <command>` | Run a shell command | **always** |
 | `/statusline [segments]` | With no arguments, list segments and the current order; with names, set and save them | — |
-| `/forget` | Clear conversation history, in memory and on disk | no |
+| `/forget` | Clear the current chat's history, in memory and on disk (other chats are untouched) | no |
 | `/compact` | Summarize older history into a running summary now, freeing up context budget | no |
 | `/notes` | Show saved cross-session notes (`~/.raven/memory/notes.md`) | — |
 | `/exit`, `/quit` | Leave (plain `exit` / `quit` also work) | — |
@@ -57,6 +57,7 @@ shared with interactive mode; a real error prints and exits with status 1.
 |---|---|
 | `Ctrl+C` | Cancel the current request. The half-finished turn is rolled back so it can't confuse the next one. |
 | `Ctrl+O` | Show or hide the model's reasoning trace for the last reply (collapsed by default). It lives in the bottom toolbar, so it toggles instantly with no new reply needed. |
+| `Ctrl+V` | Toggle push-to-talk voice input — press to start recording, press again to stop, transcribe locally, and insert the text into the input buffer for review (never auto-sent). Needs optional packages; see "Voice input" below. Silently does nothing useful (inserts a "not set up" note) if they're missing. |
 
 ### While it works and after it replies
 
@@ -100,14 +101,15 @@ New segments are one function in `raven/statusline.py`.
 
 ## Agent tools
 
-The model has 33 tools, but only the ones in "Files and shell" below (plus
-`load_skill` itself) are sent on every request — everything under
-"Applications and windows", "Web", "Browser interaction", and "Gmail" is
-grouped into a named **skill** (`desktop`, `web`, `browser`, `gmail`
-respectively) that stays locked until the model calls `load_skill` for it,
-then works exactly like any other tool for the rest of that session (see
-"Skills" below for why). "Confirms" means you are asked to allow it before
-it runs; the prompt is built from what is about to happen.
+The model has 35 tools (34 registered + `load_skill` itself), but only the
+ones in "Files and shell" below (plus `load_skill`) are sent on every
+request — everything under "Applications and windows", "Web", "Browser
+interaction", "Vision", and "Gmail" is grouped into a named **skill**
+(`desktop`, `web`, `browser`, `vision`, `gmail` respectively) that stays
+locked until the model calls `load_skill` for it, then works exactly like
+any other tool for the rest of that session (see "Skills" below for why).
+"Confirms" means you are asked to allow it before it runs; the prompt is
+built from what is about to happen.
 
 ### Files and shell
 
@@ -222,6 +224,19 @@ label**, not CSS.
 | `browser_type` | Type into a field by its label or placeholder | no |
 | `browser_submit` | Click a control that commits an action (submit, buy, send, log in) | yes |
 | `browser_close` | Close the browser session | no |
+| `browser_screenshot` | Save a PNG of the current page to a temp file, return its path — pair with `analyze_image` to actually see it | no |
+
+### Vision
+
+| Tool | What it does | Confirms? |
+|---|---|---|
+| `analyze_image` | Look at an image file (screenshot, photo, diagram) and answer a question about it | no |
+
+Uses a **separate**, configurable model (`settings.json`'s `model.vision`),
+not the main chat model — the default may not support images at all. A
+full-desktop screenshot (rather than just R.A.V.E.N's own browser page) isn't
+supported yet; it needs the Wayland/GNOME screenshot portal's more involved
+async permission flow.
 
 ### Gmail
 
@@ -239,6 +254,47 @@ existing mail.
 For a reply, the prompt shows where the mail will really go, not just the
 visible sender, because a sender can set `Reply-To` elsewhere. If that lookup
 fails, the prompt still appears. A recipient containing a line break is refused.
+
+---
+
+## Voice input (V1)
+
+`Ctrl+V` toggles push-to-talk: press to start recording, press again to stop.
+Transcribed locally and offline via [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+— no network call, no OpenRouter quota used — and inserted into the input
+buffer for review/editing, never auto-sent.
+
+Needs two optional Python packages (`sounddevice`, `faster-whisper`) plus,
+**on Linux only**, the system PortAudio library:
+
+```bash
+pip install sounddevice faster-whisper
+sudo apt install libportaudio2   # Debian/Ubuntu; dnf/pacman equivalents on other distros
+```
+
+This is a real, unavoidable requirement for ANY Linux user who wants voice
+input — `sounddevice`'s Linux wheel doesn't bundle PortAudio the way its
+Windows/macOS wheels do, so without the system library it fails at import
+with `OSError: PortAudio library not found`. None of it is required to run
+R.A.V.E.N at all: missing dependencies just make `Ctrl+V` insert a
+"voice input not set up" note instead of recording — everything else is
+completely unaffected. The model weights (~140MB) are downloaded once via
+the explicit `python -m raven.voice` command (use `HF_HUB_DISABLE_XET=1` if it
+stalls at 0 bytes) — a keypress never downloads anything; until then `Ctrl+V`
+shows "voice model not downloaded" in the toolbar. Transcription runs on a
+background thread so the UI never blocks. `Ctrl+C` at the prompt clears the
+line; `Ctrl+D` on an empty prompt exits. `Ctrl+V` is voice, not paste — use
+the terminal's paste shortcut (usually `Ctrl+Shift+V`).
+
+---
+
+## Installing and the desktop app (Step 3.58)
+
+`pip install .` (optional extra: `.[voice]`) installs the `raven` and `raven-server`
+commands on any OS. The desktop app (`raven_ui/`) starts the Python server itself and
+`npm run make` builds an installer for the current OS (Windows Setup.exe / macOS zip /
+Linux deb+rpm). Only the Linux build has been exercised; installers are unsigned and the
+app still requires Python with the package installed. Details: README "Setup" and "Desktop app".
 
 ---
 
@@ -287,7 +343,7 @@ Eleven tools can ask for permission. What each guard actually is:
 | `delete_file` | always | code |
 | `close_app` | always ("close ALL windows of X") | code |
 | `close_window` | always | code |
-| `run_command` | unless a plain read-only program, or user-trusted (`permissions.allow_commands`) | code (allow-list plus metacharacter check) |
+| `run_command` | unless a read-only program or a pipeline of read-only programs (e.g. `pdftotext f.pdf - \| head`), or user-trusted (`permissions.allow_commands`) | code (allow-list plus metacharacter check) |
 | `run_tests` | same policy as `run_command` | code |
 | `git` | unless `status`/`log`/`diff`/`show`, or user-trusted (`permissions.allow_git`), with no metacharacters | code |
 | `browser_submit` | always | code |
@@ -434,9 +490,18 @@ Not everything works out of the box; some tools depend on your system.
   (`ls` and the like). The two paths use different rules.
 
 **Platform**
-- Built for a **Linux desktop**. App handling relies on `.desktop` files,
-  `gtk-launch` and `xdg-open`; window control is **GNOME + Wayland + the Window
-  Calls extension** specifically. It will not work as-is on macOS or Windows.
+- **Linux is the only platform where app/window control has been run for real.**
+  Linux uses `.desktop` files, `gtk-launch`, `xdg-open` and (for windows) the
+  **GNOME + Wayland + Window Calls extension**. Windows and macOS backends exist
+  (`raven/platforms/windows.py`, `macos.py`; Step 3.57) and are unit-tested with faked
+  OS calls, but have **not been run on real Windows/macOS** -- see the two test checklists.
+  Windows: apps come from Start Menu shortcuts (Store/UWP apps without one aren't
+  listed), windows are each process's *main* window only, closing is polite
+  (unsaved-changes prompts can refuse). macOS: apps are `.app` bundles, closing
+  uses AppleScript (checks the app is running first so it never launches one just
+  to quit it), and listing/closing windows needs Accessibility permission for the
+  terminal app. The read-only command allow-list is Windows-aware (`dir`, `type`,
+  `where`, `findstr`; `^` and `%VAR%` treated as unsafe).
 - `close_app` closes **all** windows of an app. Per-window closing is only
   `close_window`.
 
@@ -458,7 +523,14 @@ Not everything works out of the box; some tools depend on your system.
   change from call to call, and there is a daily request cap.
 
 **Not built yet**
-- Voice input and voice output.
+- Voice *output* (text-to-speech) — voice *input* is built (see "Voice input" above).
+- A full-desktop screenshot for vision — only R.A.V.E.N's own browser page
+  can be captured (`browser_screenshot`) until the Wayland/GNOME screenshot
+  portal's async flow is built.
+- `analyze_image`'s live model call is unverified as of 2026-09-23 — built
+  and unit-tested, but never yet confirmed against a real vision model
+  (blocked by OpenRouter's daily quota that day); check DEV_LOG before
+  assuming it works end to end.
 - Streaming replies (text appearing as it is generated).
 - Searching or recalling *past* sessions — history is one continuous
   conversation, not searchable.

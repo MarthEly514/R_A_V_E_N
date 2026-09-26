@@ -25,10 +25,12 @@ def settings_path(tmp_path, monkeypatch):
 
 @pytest.fixture
 def app_dirs(tmp_path, monkeypatch):
-    """Point tools.APP_DIRS at one throwaway directory of fabricated .desktop
-    files, so app-matching tests don't depend on what's actually installed on
-    whatever machine runs the suite."""
-    from raven import tools
+    """Point the Linux backend's APP_DIRS at one throwaway directory of
+    fabricated .desktop files, so app-matching tests don't depend on what's
+    actually installed on whatever machine runs the suite. Also forces the
+    Linux backend, so these tests mean the same thing on any OS."""
+    from raven import platforms
+    from raven.platforms import linux
     apps_dir = tmp_path / "applications"
     apps_dir.mkdir()
 
@@ -47,8 +49,10 @@ def app_dirs(tmp_path, monkeypatch):
     write("r-base", "R", "R")  # the one-letter-name regression case
     write("hidden-app", "Hidden Thing", "hidden-thing", no_display=True)
 
-    monkeypatch.setattr(tools, "APP_DIRS", [apps_dir])
-    return apps_dir
+    monkeypatch.setattr(linux, "APP_DIRS", [apps_dir])
+    platforms.set_backend(linux.LinuxBackend())
+    yield apps_dir
+    platforms.set_backend(None)
 
 
 @pytest.fixture(scope="session")

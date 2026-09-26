@@ -29,6 +29,8 @@ NO_CONFIRM_PROBES = {
     "grep": {"pattern": "x"},
     "glob_files": {"pattern": "x"},
     "tree": {},
+    "analyze_image": {"path": "x", "question": "what is this?"},
+    "browser_screenshot": {},
     "open_app": {"name": "x"},
     "open_file": {"path": "x"},
     "list_apps": {},
@@ -172,6 +174,36 @@ DANGEROUS_COMMANDS = [
     "",
     "   ",
 ]
+
+
+# Read-only pipelines (found live: summarizing a PDF asked for confirmation 7 times).
+SAFE_PIPELINE_COMMANDS = [
+    "which pdftotext 2>/dev/null",
+    "pdftotext ~/Documents/x.pdf - | head -500",
+    "pdftotext ~/Documents/x.pdf -",
+    'pdftotext x.pdf - | grep -n "^[A-Z][a-z0-9 ,./\'-]*$" | head -80',
+    "sed -n '/start here/,$p' notes.txt",
+    "sed -n 10,20p notes.txt",
+    'find . -name "*.py" | wc -l',
+]
+UNSAFE_PIPELINE_COMMANDS = [
+    "pdftotext x.pdf /tmp/out.txt",                       # writes a file
+    "pdftotext x.pdf /tmp/o.txt && wc -l /tmp/o.txt",     # chaining
+    "sed -i s/a/b/ f", 'sed -n "w /tmp/p"',               # sed that writes
+    "find . -delete", "find . -exec rm {} ;", "sort -o f f",
+    "grep x f | sh", "cat f | rm", "ls || rm x", "ls & rm x",
+    'echo "$(id)"', "echo `id`", "cat f > g", "echo 'unterminated",
+]
+
+
+@pytest.mark.parametrize("command", SAFE_PIPELINE_COMMANDS)
+def test_run_command_read_only_pipelines_skip_confirmation(command):
+    assert Assistant._confirm_prompt("run_command", {"command": command}) is None
+
+
+@pytest.mark.parametrize("command", UNSAFE_PIPELINE_COMMANDS)
+def test_run_command_pipelines_with_anything_unsafe_still_confirm(command):
+    assert Assistant._confirm_prompt("run_command", {"command": command}) is not None
 
 
 @pytest.mark.parametrize("command", SAFE_PLAIN_COMMANDS)
@@ -822,6 +854,29 @@ def test_load_skill_with_no_system_prompt_attribute_does_not_crash():
     assert "Loaded skill 'web'" in result
 
 
+def test_load_skill_with_a_real_provider_whose_system_prompt_is_still_none_does_not_crash():
+    """Regression guard for a real bug: LLMProvider declares system_prompt
+    with a None default (for typing reasons -- see llm_provider.py), so a
+    REAL LLMProvider subclass that never sets it to an actual string has
+    hasattr(provider, "system_prompt") == True but the VALUE is None --
+    `self.provider.system_prompt += addition` used to crash with
+    "unsupported operand type(s) for +=: 'NoneType' and 'str'" in exactly
+    this case, which plain hasattr couldn't distinguish from "has a real
+    string". Found live, fixed with `getattr(..., None) is not None`."""
+    from raven.llm_provider import LLMProvider
+
+    class MinimalProvider(LLMProvider):
+        def reply(self, messages, tools=None):
+            return {"role": "assistant", "content": "hi"}
+
+    provider = MinimalProvider()
+    assert provider.system_prompt is None  # the exact condition that crashed
+    a = Assistant(provider)
+    result = a._load_skill("web")  # must not raise
+    assert "Loaded skill 'web'" in result
+    assert provider.system_prompt is None  # still untouched -- nothing to append to
+
+
 def test_run_tool_routes_load_skill_before_the_generic_dispatch():
     """End-to-end through _run_tool -- confirms load_skill never goes
     through _confirm_prompt/hooks/TOOL_FUNCTIONS, all of which don't apply
@@ -856,3 +911,134 @@ def test_active_skills_never_shrinks_the_core_set():
     a._load_skill("desktop")
     names = {s["function"]["name"] for s in a._active_tool_specs()}
     assert tool_impl.core_tool_names() <= names
+
+
+# ---------------------------------------------------------------------------
+# analyze_image / _analyze_image (V2): needs self.provider, intercepted in
+# _run_tool the same way load_skill is -- never confirmed, never raises.
+# ---------------------------------------------------------------------------
+
+class VisionProvider:
+    """Fake provider with reply_with_image, recording every call."""
+    def __init__(self, answer="a red circle"):
+        self.answer = answer
+        self.calls = []
+
+    def reply_with_image(self, question, image_b64, mime_type, model):
+        self.calls.append((question, image_b64, mime_type, model))
+        return self.answer
+
+
+def test_analyze_image_with_no_vision_model_configured():
+    a = Assistant(provider=VisionProvider())  # no settings -> no vision_model
+    result = a._analyze_image("x.png", "what is this?")
+    assert "no vision model configured" in result.lower()
+
+
+def test_analyze_image_with_a_provider_that_does_not_support_it():
+    """Duck-typed fake, not inheriting from LLMProvider at all -- hasattr is
+    False, no reply_with_image attribute exists at all."""
+    class PlainProvider:
+        def reply(self, messages, tools=None):
+            return {"role": "assistant", "content": "x"}
+    a = Assistant(PlainProvider(), settings={"model": {"vision": "some-vision-model"}})
+    result = a._analyze_image("x.png", "what is this?")
+    assert "doesn't support image analysis" in result
+
+
+def test_analyze_image_with_a_real_llm_provider_that_does_not_override_it(tmp_path):
+    """A REAL LLMProvider subclass that just doesn't override reply_with_image
+    -- hasattr is True (inherited from the ABC), so this exercises the OTHER
+    path: the base class's NotImplementedError default, caught by the
+    surrounding try/except and reported as a normal Error string, not a
+    crash. Uses a real, EXISTING file (unlike the duck-typed-provider test
+    above) so it actually reaches the reply_with_image call, rather than
+    returning early on a "file not found" it isn't testing here."""
+    from raven.llm_provider import LLMProvider
+
+    class MinimalProvider(LLMProvider):
+        def reply(self, messages, tools=None):
+            return {"role": "assistant", "content": "x"}
+
+    image = tmp_path / "photo.png"
+    image.write_bytes(b"fake png bytes")
+    a = Assistant(MinimalProvider(), settings={"model": {"vision": "some-vision-model"}})
+    result = a._analyze_image(str(image), "what is this?")
+    assert result.startswith("Error:")
+    assert "does not support image analysis" in result
+
+
+def test_analyze_image_unreadable_file_reports_an_error_not_a_crash(tmp_path):
+    provider = VisionProvider()
+    a = Assistant(provider, settings={"model": {"vision": "some-vision-model"}})
+    missing = tmp_path / "does_not_exist.png"
+    result = a._analyze_image(str(missing), "what is this?")
+    assert "Error" in result
+    assert provider.calls == []  # never even attempted the API call
+
+
+def test_analyze_image_reads_the_real_file_and_calls_the_vision_model(tmp_path):
+    image = tmp_path / "photo.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nfake png bytes")
+    provider = VisionProvider("a red circle on a white background")
+    a = Assistant(provider, settings={"model": {"vision": "some-vision-model"}})
+    result = a._analyze_image(str(image), "describe this")
+    assert result == "a red circle on a white background"
+    assert len(provider.calls) == 1
+    question, image_b64, mime_type, model = provider.calls[0]
+    assert question == "describe this"
+    assert mime_type == "image/png"
+    assert model == "some-vision-model"
+    import base64
+    assert base64.b64decode(image_b64) == image.read_bytes()
+
+
+def test_analyze_image_propagates_a_failed_api_call_as_an_error_string():
+    class FailingProvider:
+        def reply_with_image(self, question, image_b64, mime_type, model):
+            raise RuntimeError("OpenRouter 429: rate limited")
+    a = Assistant(FailingProvider(), settings={"model": {"vision": "some-vision-model"}})
+    import tempfile, os
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        result = a._analyze_image(path, "what is this?")
+        assert result.startswith("Error:")
+    finally:
+        os.remove(path)
+
+
+def test_run_tool_routes_analyze_image_before_the_generic_dispatch():
+    """End-to-end through _run_tool, like the equivalent load_skill test --
+    confirms analyze_image never goes through _confirm_prompt/hooks/the
+    real TOOL_FUNCTIONS placeholder (which would raise if actually called)."""
+    confirms = []
+    image = None
+    provider = VisionProvider("a cat")
+    a = Assistant(provider, confirm_run=lambda p: confirms.append(p) or True,
+                  settings={"model": {"vision": "some-vision-model"}})
+    import tempfile, os
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.write(fd, b"fake image bytes")
+    os.close(fd)
+    try:
+        result = a._run_tool(_call("analyze_image", {"path": path, "question": "what animal is this?"}))
+    finally:
+        os.remove(path)
+    assert result == "a cat"
+    assert confirms == []
+    assert provider.calls[0][0] == "what animal is this?"
+
+
+def test_analyze_image_defaults_the_question_when_omitted():
+    provider = VisionProvider("a landscape")
+    a = Assistant(provider, settings={"model": {"vision": "some-vision-model"}})
+    import tempfile, os
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.write(fd, b"x")
+    os.close(fd)
+    try:
+        a._run_tool(_call("analyze_image", {"path": path}))
+    finally:
+        os.remove(path)
+    assert provider.calls[0][0] == "Describe this image."

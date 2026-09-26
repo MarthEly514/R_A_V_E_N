@@ -1,12 +1,16 @@
 """Conversation state and tool-calling orchestration."""
+import base64
 import json
+import mimetypes
 import re
 import time
+from pathlib import Path
 from typing import Callable
 
 from raven.llm_provider import LLMProvider, SKILL_PROMPTS
 from raven.store import Store
 from raven import gmail as gmail_impl
+from raven import platforms as plat
 from raven import tools as tool_impl
 
 MAX_TOOL_ITERATIONS = 10  # was 5; browser workflows (navigate/read/act/verify) routinely need more
@@ -37,6 +41,130 @@ SAFE_COMMANDS = {
 # check" — chaining (; | &), redirection (< >), or substitution (` $ ( )) can hide an
 # unsafe command behind a safe-looking start, e.g. "git log ; rm -rf ~" or "ls > file".
 _SHELL_METACHARS = set(";|&<>`$()\n")
+
+# Windows (cmd.exe) equivalents of the read-only programs above. Only consulted
+# on Windows; the Unix names stay in the set too, since Git Bash/WSL tools may exist.
+SAFE_COMMANDS_WINDOWS = {"dir", "type", "where", "findstr", "ver", "hostname", "whoami"}
+# cmd.exe has extra metacharacters: `^` (escape) and `%VAR%` (expansion -- which
+# happens even inside double quotes) -- rejected anywhere on Windows.
+_WINDOWS_EXTRA_METACHARS = set("^%")
+
+# Read-only programs that are only safe with certain arguments, or that are only
+# meaningful as part of a pipeline (grep/sort/cut...). Each maps to a checker
+# over the argument list (program name excluded). Everything here writes nothing
+# and executes nothing -- e.g. NOT `find -exec/-delete`, `sort -o`, `sed -i`.
+_SED_PRINT_RE = re.compile(r"^(\d+|\$|/[^/]*/)?(,(\d+|\$|/[^/]*/))?p$")
+
+
+def _args_ok_find(args):
+    return not any(a in ("-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf", "-fls")
+                   for a in args)
+
+
+def _args_ok_sort(args):
+    # Windows `sort /O file` writes its output to a file.
+    if plat.is_windows() and any(a.lower().startswith("/o") for a in args):
+        return False
+    return not any(a == "-o" or a.startswith("--output") or (a.startswith("-") and not a.startswith("--") and "o" in a[1:])
+                   for a in args)
+
+
+def _args_ok_sed(args):
+    # only the print-a-range form: sed -n '10,20p' / '/start/,/end/p' -- never -i/-e/-f or w/e commands
+    if "-n" not in args:
+        return False
+    rest = [a for a in args if a != "-n"]
+    return bool(rest) and bool(_SED_PRINT_RE.match(rest[0])) and not any(a.startswith("-") for a in rest[:1])
+
+
+def _args_ok_pdftotext(args):
+    # writes a file unless the output target is stdout ("-")
+    return len(args) >= 2 and args[-1] == "-"
+
+
+_CONDITIONALLY_SAFE = {
+    "find": _args_ok_find, "sort": _args_ok_sort, "sed": _args_ok_sed, "pdftotext": _args_ok_pdftotext,
+}
+# Always-safe read-only filters/inspectors (beyond SAFE_COMMANDS).
+_SAFE_FILTERS = {"grep", "egrep", "fgrep", "uniq", "cut", "tr", "file", "stat", "pdfinfo", "basename", "dirname", "realpath", "nl"}
+
+
+def _split_safe_pipeline(command: str) -> list[str] | None:
+    """Split `command` on unquoted `|` into segments, or None if anything
+    other than plain words/quoted strings/`|`/a stderr redirect appears
+    outside quotes (chaining, other redirection, substitution...).
+
+    POSIX shells: single quotes are fully literal; inside double quotes a
+    backtick or a `$` that starts an expansion is still rejected. Allowed
+    redirects: `2>/dev/null`, `2>&1`.
+    Windows (cmd.exe): only DOUBLE quotes quote anything (a single quote is
+    an ordinary character, so `'a|b'` really pipes); `^` and `%` are
+    rejected everywhere (escape / %VAR% expansion, which applies inside
+    quotes too). Allowed redirects: `2>nul`, `2>&1`."""
+    windows = plat.is_windows()
+    stderr_redirects = ("2>nul", "2>&1") if windows else ("2>/dev/null", "2>&1")
+    if windows and any(c in _WINDOWS_EXTRA_METACHARS for c in command):
+        return None
+    segments, cur, i, n = [], [], 0, len(command)
+    while i < n:
+        c = command[i]
+        if c == "'" and not windows:
+            j = command.find("'", i + 1)
+            if j == -1:
+                return None
+            cur.append(command[i:j + 1]); i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and command[j] != '"':
+                if command[j] == "\\" and not windows:
+                    j += 1
+                elif command[j] == "`":
+                    return None
+                elif command[j] == "$" and j + 1 < n and command[j + 1] != '"' and not windows:
+                    return None
+                j += 1
+            if j >= n:
+                return None
+            cur.append(command[i:j + 1]); i = j + 1
+        elif c == "\\" and not windows:
+            if i + 1 >= n or command[i + 1] == "\n":
+                return None
+            cur.append(command[i:i + 2]); i += 2
+        elif c == "|":
+            if i + 1 < n and command[i + 1] == "|":
+                return None
+            segments.append("".join(cur)); cur = []; i += 1
+        elif any(command[i:i + len(r)].lower() == r for r in stderr_redirects):
+            i += next(len(r) for r in stderr_redirects if command[i:i + len(r)].lower() == r)
+        elif c in _SHELL_METACHARS:
+            return None
+        else:
+            cur.append(c); i += 1
+    segments.append("".join(cur))
+    return segments
+
+
+def _segment_is_safe(segment: str, allowed: frozenset[str]) -> bool:
+    import shlex
+    windows = plat.is_windows()
+    try:
+        # posix=False on Windows so backslashes in paths (C:\Users\x) survive.
+        words = shlex.split(segment, posix=not windows)
+    except ValueError:
+        return False
+    if not words:
+        return False
+    program = words[0].strip('"').replace("\\", "/").rsplit("/", 1)[-1]
+    if windows:
+        program = program.lower()
+        if program.endswith(".exe"):
+            program = program[:-4]
+    args = [a.strip('"') for a in words[1:]] if windows else words[1:]
+    if program in _CONDITIONALLY_SAFE:
+        return _CONDITIONALLY_SAFE[program](args)
+    safe = SAFE_COMMANDS | SAFE_COMMANDS_WINDOWS if windows else SAFE_COMMANDS
+    return program in safe or program in _SAFE_FILTERS or program in allowed
+
 
 # D2: the one tool always offered beyond tool_impl.core_tool_names() -- lives
 # here (not in tools.py's TOOL_SPECS/TOOL_FUNCTIONS) since it's not a "operate
@@ -126,6 +254,11 @@ class Assistant:
         # stays the simple, permanent ground truth, and re-loading a skill
         # if/when it's next needed is cheap and correct either way.
         self.active_skills: set[str] = set()
+        # V2: a SEPARATE model for analyze_image -- the main chat model isn't
+        # necessarily vision-capable. None (no settings, or no model.vision
+        # key) means analyze_image reports a clear error rather than trying
+        # and failing against a model that can't handle images.
+        self.vision_model = (settings or {}).get("model", {}).get("vision")
         self.history: list[dict] = store.load() if store else []
         self._persisted = len(self.history)
         self.last_elapsed = 0.0  # wall time of the last completed ask(), in seconds
@@ -309,18 +442,51 @@ class Assistant:
         provider has one) extend its live system_prompt with that skill's
         guardrail instructions -- mutated in place, so every subsequent
         reply() call picks it up automatically with no other plumbing
-        needed. hasattr guards this for a fake/test provider with no
-        system_prompt attribute at all: the tools still unlock either way,
-        which is the larger of the two benefits."""
+        needed. getattr(..., None) guards this for BOTH cases where there's
+        nothing to append to: a duck-typed fake/test provider with no
+        system_prompt attribute at all (returns None, the default), and a
+        REAL LLMProvider subclass that just never set it to an actual
+        string (also None -- LLMProvider itself declares it with a None
+        default, purely so the attribute is validly TYPED on the ABC; it's
+        still None on any subclass that doesn't override it, so checking
+        `is not None` here, not just attribute existence, is required --
+        `hasattr` alone would be True in that second case and crash trying
+        to += a string onto None. The tools still unlock either way in both
+        cases, which is the larger of the two benefits."""
         if name not in tool_impl.SKILLS:
             return f"Unknown skill: {name}. Available: {', '.join(tool_impl.SKILLS)}."
         if name in self.active_skills:
             return f"Skill '{name}' is already loaded."
         self.active_skills.add(name)
         addition = SKILL_PROMPTS.get(name, "")
-        if addition and hasattr(self.provider, "system_prompt"):
-            self.provider.system_prompt += addition
+        current_prompt = getattr(self.provider, "system_prompt", None)
+        if addition and current_prompt is not None:
+            self.provider.system_prompt = current_prompt + addition
         return f"Loaded skill '{name}': {', '.join(tool_impl.SKILLS[name])}"
+
+    def _analyze_image(self, path: str, question: str) -> str:
+        """Handles analyze_image (V2) -- intercepted in _run_tool before the
+        generic dispatch, same reason as load_skill: it needs self.provider
+        to make a real vision-model call, which a plain tool_impl.py
+        function has no access to. Read-only, never confirmed, same policy
+        as read_file/browser_read. Never raises -- every failure mode
+        (unconfigured model, unsupported provider, unreadable file, a failed
+        API call) is reported as a normal "Error: ..." string, consistent
+        with every other tool's error convention in this project."""
+        if not self.vision_model:
+            return "Error: no vision model configured (settings.json's model.vision)."
+        if not hasattr(self.provider, "reply_with_image"):
+            return "Error: this provider doesn't support image analysis."
+        try:
+            image_bytes = Path(path).expanduser().resolve().read_bytes()
+        except OSError as e:
+            return f"Error: couldn't read {path}: {e}"
+        mime_type = mimetypes.guess_type(path)[0] or "image/png"
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        try:
+            return self.provider.reply_with_image(question, image_b64, mime_type, self.vision_model)
+        except Exception as e:
+            return f"Error: {e}"
 
     def forget(self) -> None:
         """Clear conversation history, in memory and on disk. Stale tool results
@@ -342,10 +508,15 @@ class Assistant:
         in `allowed`, so a user-trusted program name never becomes a way to
         smuggle in chaining/redirection/substitution."""
         command = command.strip()
-        if not command or _has_shell_metachars(command):
+        if not command:
             return False
-        program = command.split()[0].rsplit("/", 1)[-1]  # strip any path prefix
-        return program in SAFE_COMMANDS or program in allowed
+        # A pipeline of read-only programs (e.g. `pdftotext f.pdf - | head -50`)
+        # is as safe as its parts; ANY unsafe segment, or any unquoted
+        # chaining/redirection/substitution, makes the whole command need confirmation.
+        segments = _split_safe_pipeline(command)
+        if segments is None:
+            return False
+        return all(_segment_is_safe(seg, allowed) for seg in segments)
 
     @staticmethod
     def _confirm_prompt(
@@ -445,6 +616,14 @@ class Assistant:
             # confirmation/hook/dispatch machinery below, none of which
             # applies to it (never confirmed, no hooks, no TOOL_FUNCTIONS entry).
             return self._load_skill(args.get("name", ""))
+        if name == "analyze_image":
+            # Needs self.provider for a real vision-model call -- tools.py's
+            # analyze_image is only a placeholder (see its docstring), same
+            # interception shape as load_skill above, but this one DOES flow
+            # through the normal skill-gating/registry (tools.SKILLS/TOOL_SPECS)
+            # since it's a real, skill-gated tool from the model's point of
+            # view, just not a plain tool_impl.py function underneath.
+            return self._analyze_image(args.get("path", ""), args.get("question") or "Describe this image.")
         prompt = self._confirm_prompt(name, args, self.allowed_commands, self.allowed_git)
         if prompt and not self.confirm_run(prompt):
             return "Cancelled by user."

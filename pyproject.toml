@@ -12,18 +12,25 @@ dependencies = [
     "google-api-python-client",
     "google-auth-httplib2",
     "google-auth-oauthlib",
-
+    "fastapi",
+    "uvicorn[standard]",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+# Push-to-talk voice input. On Linux also needs the system library: sudo apt install libportaudio2
+voice = ["sounddevice", "faster-whisper", "numpy"]
+dev = ["pytest", "httpx", "numpy"]
 
 [project.scripts]
 raven = "raven.cli:main"
+raven-server = "raven.server:main"
 
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["raven", "raven.*"]  # exactly the package: NOT raven_ui/ (the Electron app) or tests/
 
 [tool.pytest.ini_options]
 markers = [

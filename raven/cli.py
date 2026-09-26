@@ -1,6 +1,8 @@
 """CLI entry point for R.A.V.E.N."""
 import argparse
 
+from pathlib import Path
+
 import psutil
 import threading
 from rich.console import Console
@@ -18,11 +20,12 @@ from raven.config import get_api_key, load_settings, save_settings, SETTINGS_PAT
 from raven.llm_provider import OpenRouterProvider, load_project_rules
 from raven.assistant import Assistant
 from raven.store import Store
-from raven import tools, statusline
+from raven import tools, statusline, voice
 from random import randint
 
 SETTINGS: dict = {}  # populated in main(); /statusline edits it live
-UI_STATE = {"show_thoughts": False}  # ctrl+o toggles whether reasoning traces are expanded
+UI_STATE = {"show_thoughts": False, "recording": False, "voice_status": ""}  # ctrl+o/ctrl+v toggles
+VOICE_RECORDER = voice.Recorder()  # cheap to construct; no mic opened until .start()
 ASSISTANT: Assistant | None = None  # populated in main(); /forget clears its history
 
 # primary_color = "#C9A3FF"
@@ -46,14 +49,28 @@ STARTUP_SENTENCES = [
 THINKING_WORDS = [
     "Working on it...",
     "Thinking...",
-    "Raveing...",
+    "Ravening...",
     "Swimming...",
     "Calculating...",
     "Casting...",
     "Mogging...",
     "Smoking...",
     "Pasting...",
-    ""
+    "Burning...", 
+    "Evaporating...",
+    "Hallucinating...",
+    "Demotivating...",
+    "Catastrophing...",
+    "Ctrl+C-ing...",
+    "Ctrl+V-ing...",
+    "Whispering...",
+    "Traveling...",
+    "Cooking...",
+    "Eating...",
+    "Combusting...",
+    "Vibe coding...",
+    "Crushing...",
+    
 ]
 
 # A small custom Rich spinner (registered into rich.spinner.SPINNERS, the
@@ -122,6 +139,8 @@ TOOL_STATUS = {
     "browser_type": lambda a: f"Typing into \"{a.get('text', '')}\"...",
     "browser_submit": lambda a: f"Submitting \"{a.get('text', '')}\"...",
     "browser_close": lambda a: "Closing the browser session...",
+    "browser_screenshot": lambda a: "Taking a screenshot...",
+    "analyze_image": lambda a: f"Looking at {a.get('path', 'the image')}...",
     "gmail_list_messages": lambda a: "Checking Gmail...",
     "gmail_read_message": lambda a: "Reading an email...",
     "gmail_send_message": lambda a: f"Sending an email to {a.get('to', '')}...",
@@ -150,6 +169,7 @@ def show_help(_args: str = ""):
     table.add_row("/forget", "Clear conversation history (in memory and on disk)")
     table.add_row("/compact", "Summarize older history to free up context budget now")
     table.add_row("/notes", "Show saved cross-session notes (~/.raven/memory/notes.md)")
+    table.add_row("/skills", "Show which skills are currently loaded this session")
     table.add_row("/exit", "Exit R.A.V.E.N")
     console.print(table)
     console.print()
@@ -161,7 +181,7 @@ def show_status(_args: str = ""):
     table.add_column("Status")
     table.add_row("CPU", f"{psutil.cpu_percent(interval=0.3):.1f}%")
     table.add_row("Memory", f"{psutil.virtual_memory().percent:.1f}%")
-    table.add_row("Disk", f"{psutil.disk_usage('/').percent:.1f}%")
+    table.add_row("Disk", f"{psutil.disk_usage(Path.cwd().anchor or '/').percent:.1f}%")
     console.print(table)
     console.print()
 
@@ -193,6 +213,25 @@ def handle_compact(_args: str = ""):
         result = ASSISTANT.compact()
     style = "green" if result.startswith("Compacted") else "dim"
     console.print(f"[{style}]{'✓ ' if style == 'green' else ''}{result}[/{style}]")
+    console.print()
+
+
+def handle_skills(_args: str = ""):
+    """Read-only view of which skills (D2) are currently loaded this
+    session and what each one covers -- writes only happen via the model's
+    own load_skill tool call, same read-only-visibility pattern as /notes
+    and /statusline's no-args listing."""
+    assert ASSISTANT is not None
+    table = Table(title="Skills")
+    table.add_column("Skill", style=primary_color)
+    table.add_column("Description")
+    table.add_column("Tools")
+    for name, tool_names in tools.SKILLS.items():
+        mark = "•" if name in ASSISTANT.active_skills else " "
+        table.add_row(f"{mark} {name}", tools.SKILL_DESCRIPTIONS.get(name, ""), ", ".join(tool_names))
+    console.print(table)
+    console.print("[dim]Loaded by the model itself via load_skill when a task needs one -- "
+                  "nothing to load manually. Core tools (always available) aren't listed here.[/]")
     console.print()
 
 
@@ -269,6 +308,7 @@ COMMANDS = {
     "/forget": handle_forget,
     "/compact": handle_compact,
     "/notes": handle_notes,
+    "/skills": handle_skills,
     "/exit": handle_exit,
     "/quit": handle_exit,
 
@@ -282,6 +322,68 @@ KEY_BINDINGS = KeyBindings()
 @KEY_BINDINGS.add("c-o")
 def _toggle_thoughts(event):
     UI_STATE["show_thoughts"] = not UI_STATE["show_thoughts"]
+
+
+def _run_transcription(audio, buffer, app) -> None:
+    """Transcribe `audio` and insert the result into the input buffer.
+    Runs on a BACKGROUND thread (see _toggle_recording) -- never on
+    prompt_toolkit's event-loop thread, because loading the Whisper model
+    and transcribing take seconds and used to freeze the whole UI
+    (Ctrl+C and Ctrl+V included) while they ran. Results go back to the
+    UI thread via call_soon_threadsafe, the only safe way to touch a
+    prompt_toolkit buffer from another thread."""
+    try:
+        text = voice.transcribe(audio)
+        error = ""
+    except voice.ModelNotDownloadedError as e:
+        text, error = "", str(e)
+    except Exception as e:  # never let a voice failure kill the prompt
+        text, error = "", f"voice transcription failed: {e}"
+
+    def finish() -> None:
+        UI_STATE["voice_status"] = error
+        if text:
+            buffer.insert_text(text)
+        app.invalidate()
+
+    app.loop.call_soon_threadsafe(finish)
+
+
+@KEY_BINDINGS.add("c-v")
+def _toggle_recording(event):
+    """Push-to-talk, toggled (not held) -- ctrl+v starts recording, ctrl+v
+    again stops it, transcribes locally (no network, no OpenRouter quota),
+    and inserts the text into the current input buffer. Never auto-submits:
+    the user reviews/edits/discards it like anything they'd typed, same
+    posture as every other consequential action in this project.
+
+    Nothing in here may block: this runs on the event-loop thread, so
+    anything slow (model load, transcription) goes to a background thread,
+    and nothing here may touch the network (voice.model_ready is a local
+    disk check; the model is never downloaded from a keypress)."""
+    if not voice.is_available():
+        event.current_buffer.insert_text(
+            "[voice input not set up — pip install sounddevice faster-whisper]"
+        )
+        return
+    if UI_STATE["voice_status"] == "transcribing":
+        return  # still working on the previous recording
+    if not UI_STATE["recording"]:
+        if not voice.model_ready():
+            UI_STATE["voice_status"] = "voice model not downloaded — run: python -m raven.voice"
+            event.app.invalidate()
+            return
+        UI_STATE["voice_status"] = ""
+        UI_STATE["recording"] = True
+        VOICE_RECORDER.start()
+        return
+    UI_STATE["recording"] = False
+    audio = VOICE_RECORDER.stop()
+    UI_STATE["voice_status"] = "transcribing"
+    event.app.invalidate()  # show "transcribing" immediately, before the worker finishes
+    threading.Thread(
+        target=_run_transcription, args=(audio, event.current_buffer, event.app), daemon=True,
+    ).start()
 
 
 MAX_TOOLBAR_REASONING_CHARS = 1200  # keep the toolbar a status area, not an unbounded pager
@@ -307,6 +409,24 @@ def reasoning_toolbar_text(reasoning: list[str], expanded: bool) -> str:
     if len(trace) > MAX_TOOLBAR_REASONING_CHARS:
         trace = trace[:MAX_TOOLBAR_REASONING_CHARS].rstrip() + " … (truncated)"
     return "\n" + trace
+
+
+def voice_toolbar_hint(recording: bool, status: str = "") -> str:
+    """The bit of the bottom toolbar showing voice input state. Pure and
+    separately testable, same pattern as reasoning_toolbar_text -- covers
+    both the case where the optional dependencies aren't installed (so the
+    ctrl+v hint doesn't dangle a promise the key press can't keep), the
+    live recording indicator, and a transient `status` ("transcribing", or
+    an error such as the model not being downloaded yet)."""
+    if not voice.is_available():
+        return ""
+    if recording:
+        return "   [ctrl+v: recording — press again to stop]"
+    if status == "transcribing":
+        return "   [transcribing...]"
+    if status:
+        return f"   [{status}]"
+    return "   [ctrl+v: voice input]"
 
 
 def confirm_run(action: str, status: Status | None = None) -> bool:
@@ -351,6 +471,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "consequential just because no one's watching.",
     )
     return parser.parse_args(argv)
+
+
+def is_exit_command(user_input: str) -> bool:
+    """Whether `user_input` (already stripped) should end the session.
+    "/exit"/"/quit" match on the first word regardless of trailing text
+    ("/exit now" exits) -- a "/" prefix is unambiguously a command in this
+    app, never conversational text, so this is always safe. Bare
+    "exit"/"quit" stay a WHOLE-INPUT exact match, deliberately not extended
+    the same way: a sentence can genuinely start with the word "exit"
+    ("exit code 1 means what?") and must reach the model, not get silently
+    swallowed as an app-exit. Pulled out as its own function (not inlined
+    in main()'s loop) specifically so it's covered by a test -- main()
+    itself needs a real TTY and isn't."""
+    command = user_input.partition(" ")[0].lower()
+    return command in ("/exit", "/quit") or user_input.lower() in ("exit", "quit")
 
 
 def build_assistant(confirm_run_fn) -> tuple[Assistant, OpenRouterProvider]:
@@ -473,7 +608,7 @@ def main():
     def bottom_toolbar():
         thoughts = "expanded" if UI_STATE["show_thoughts"] else "collapsed"
         header = (statusline.render(provider, assistant, SETTINGS["statusline"]["segments"])
-                  + f"   [ctrl+o: thoughts {thoughts}]")
+                  + f"   [ctrl+o: thoughts {thoughts}]" + voice_toolbar_hint(UI_STATE["recording"], UI_STATE["voice_status"]))
         return header + reasoning_toolbar_text(assistant.last_reasoning, UI_STATE["show_thoughts"])
 
     session = PromptSession(
@@ -499,10 +634,19 @@ def main():
     console.print()
 
     while True:
-        user_input = session.prompt("› ").strip()
+        try:
+            user_input = session.prompt("› ").strip()
+        except KeyboardInterrupt:
+            # Ctrl+C at the prompt: discard the line, stay in the session
+            # (like a shell) instead of dying with a traceback.
+            console.print("[dim](Ctrl+D or /exit to quit)[/]")
+            continue
+        except EOFError:  # Ctrl+D
+            console.print("\n[dim]R.A.V.E.N: Standing by.[/]")
+            break
         if not user_input:
             continue
-        if user_input.lower() in ("/exit", "/quit", "exit", "quit"):
+        if is_exit_command(user_input):
             console.print("\n[dim]R.A.V.E.N: Standing by.[/]")
             break
 
@@ -513,7 +657,7 @@ def main():
 
         initial_word = THINKING_WORDS[randint(0, len(THINKING_WORDS) - 1)]
 
-        with Status(f"[dim]{initial_word} (Ctrl+C to cancel)[/]", console=console, spinner="dots3") as status:
+        with Status(f"[dim]{initial_word} (Ctrl+C to cancel)[/]", console=console, spinner="dots8Bit") as status:
             stop_rotation, pause_rotation = schedule_word_rotation(status, THINKING_WORDS, interval=5.0)
 
             def on_tool_call(name, args):

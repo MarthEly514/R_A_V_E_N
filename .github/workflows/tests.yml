@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # Linux is the reference platform and must pass. Windows/macOS support is
+    # being brought up (see DEV_LOG.md, "Cross-platform"): until each is green,
+    # their failures are informational, not blocking.
+    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install -r requirements.txt fastapi "uvicorn[standard]" httpx numpy pytest
+      - name: Test (browser tests need a downloaded Chromium, so they're skipped here)
+        env:
+          PYTHONPATH: .
+        run: python -m pytest -q --ignore=tests/test_browser.py

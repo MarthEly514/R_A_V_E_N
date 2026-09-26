@@ -6,11 +6,41 @@ by writing a new class in `raven/llm_provider.py` that implements
 
 ## Setup
 
+Any OS with Python 3.10+. Get an API key from [OpenRouter](https://openrouter.ai) (free models available).
+
 ```bash
-pip install -r requirements.txt
-export OPENROUTER_API_KEY=your-key-here
-python -m raven.cli
+git clone <repo> && cd R_A_V_E_N
+python -m venv venv
+source venv/bin/activate            # Windows: venv\Scripts\activate
+pip install .                       # installs the `raven` and `raven-server` commands
+pip install ".[voice]"              # optional: push-to-talk voice input
+export OPENROUTER_API_KEY=your-key-here     # Windows (PowerShell): $env:OPENROUTER_API_KEY="your-key"
+raven                               # or: python -m raven.cli
 ```
+
+(Or put `OPENROUTER_API_KEY=...` in a `.env` file. Developers: `pip install -e ".[dev]"`
+gives an editable install plus the test tools. `pip install -r requirements.txt` still works too.)
+
+## Desktop app
+
+A chat window for the same agent (`raven_ui/`, Electron + React + Tailwind CSS). It **starts the
+Python server for you** (`python -m raven.server`, using `py -3` / `python` on Windows,
+`python3` / `python` elsewhere -- set `RAVEN_PYTHON` to pick an interpreter), so
+`pip install .` above is the only other requirement. If a server is already running
+on port 8756 it is reused.
+
+```bash
+cd raven_ui
+npm install
+npm start                # run it in development
+npm run make             # build an installer for the OS you're on -> raven_ui/out/make/
+```
+
+`npm run make` produces: Windows `Setup.exe` (Squirrel) + zip; macOS `.app` in a zip;
+Linux `.deb` and `.rpm`. Installers are **unsigned** for now, so Windows SmartScreen and
+macOS Gatekeeper will warn on first launch (code signing needs a paid developer
+certificate). Each OS has to be built on that OS -- the `build-desktop` GitHub Action
+does all three on a tag or a manual run.
 
 ## Headless mode
 
@@ -122,19 +152,78 @@ tool-calling loop — manual `/write`, `/run`, etc. don't trigger hooks.
 
 Only file/shell/coding tools (`read_file`, `edit_file`, `grep`, `run_command`,
 `git`, `save_note`, etc.) are sent to the model on every request. Desktop app
-control, the web, R.A.V.E.N's own browser, and Gmail are
-grouped into named **skills** — `desktop`, `web`, `browser`, `gmail` — that
-the model unlocks itself with a `load_skill` call the moment a request
+control, the web, R.A.V.E.N's own browser, Gmail, and vision are
+grouped into named **skills** — `desktop`, `web`, `browser`, `gmail`, `vision`
+— that the model unlocks itself with a `load_skill` call the moment a request
 actually needs one, then uses like any other tool for the rest of that
-session. This cut R.A.V.E.N's fixed per-request overhead (system prompt +
-every tool's spec, sent regardless of what a conversation is actually about)
-by roughly half — measured at ~5.6k tokens down to ~2.75k when no skill is
-loaded, since neither the unused tool specs nor their guardrail instructions
-(e.g. the Gmail Reply-To/untrusted-content guidance, the browser submit-safety
-rule) are paid for until they're relevant. Nothing about how a loaded skill's
+session. `/skills` shows which are currently loaded. This cut R.A.V.E.N's
+fixed per-request overhead (system prompt + every tool's spec, sent
+regardless of what a conversation is actually about) by roughly half —
+measured at ~5.6k tokens down to ~2.75k when no skill is loaded, since
+neither the unused tool specs nor their guardrail instructions (e.g. the
+Gmail Reply-To/untrusted-content guidance, the browser submit-safety rule)
+are paid for until they're relevant. Nothing about how a loaded skill's
 tools behave changes — same confirmation policy, same everything — this only
 affects when their specs and instructions actually reach the model. A fresh
 session always starts back at core-only; there's no persistence to manage.
+
+## Voice input
+
+Press `ctrl+v` at the prompt to start recording, `ctrl+v` again to stop —
+transcribed locally and offline via [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
+(no OpenRouter quota used, no audio sent anywhere) and inserted into the
+input buffer for you to review, edit, or discard, exactly like anything
+you'd typed — it never auto-sends. The bottom toolbar shows `[ctrl+v: voice
+input]` when ready and `[ctrl+v: recording — press again to stop]` while
+recording.
+
+Needs two optional Python packages plus, **on Linux specifically**, a system
+library:
+
+```bash
+pip install sounddevice faster-whisper
+sudo apt install libportaudio2   # Debian/Ubuntu and derivatives (Zorin, Mint, ...)
+# Fedora:  sudo dnf install portaudio
+# Arch:    sudo pacman -S portaudio
+```
+
+That last step is a real, unavoidable requirement of the `sounddevice`
+package on Linux — its wheel doesn't bundle the PortAudio binary there the
+way it does on Windows/macOS, so without the system library it fails to
+import with `OSError: PortAudio library not found`. None of this is required
+to run R.A.V.E.N at all: without it, `ctrl+v` just inserts a
+"voice input not set up" message instead of recording, and everything else
+works exactly the same.
+
+**One-time model download (explicit, never a side effect of a keypress):**
+
+```bash
+python -m raven.voice        # downloads the Whisper "base" model (~140MB), resumable
+```
+
+Until that's done, `ctrl+v` just shows "voice model not downloaded — run:
+python -m raven.voice" in the toolbar. If the download makes no progress
+(0-byte `.incomplete` files under `~/.cache/huggingface/hub`), retry with
+`HF_HUB_DISABLE_XET=1 python -m raven.voice` — the newer Hugging Face "xet"
+transfer path stalls on some networks. Transcription runs in a background
+thread, so the prompt stays responsive; `ctrl+c` at the prompt clears the
+line (it doesn't crash), `ctrl+d` on an empty prompt exits. Note `ctrl+v`
+is bound to voice, so it does not paste — use your terminal's paste
+shortcut (usually `ctrl+shift+v`).
+
+## Vision (image analysis)
+
+`analyze_image` (in the `vision` skill) looks at an image file — a
+screenshot, a photo, a diagram — and answers a question about it, using a
+**separate**, configurable model (`settings.json`'s `model.vision`) since
+the main chat model isn't necessarily vision-capable. `browser_screenshot`
+(in the `browser` skill) saves a PNG of the current page in R.A.V.E.N's own
+browser session for `analyze_image` to look at — the two compose rather than
+being one merged tool, same as `grep`/`glob_files`. No confirmation needed
+for either (read-only). Capturing a screenshot of your actual desktop
+(rather than just R.A.V.E.N's own browser page) isn't supported yet — it
+needs the Wayland/GNOME screenshot portal's more involved async permission
+flow, a deliberate scope decision, not an oversight.
 
 ## Structure
 
@@ -210,6 +299,17 @@ Change it from inside R.A.V.E.N with `/statusline` (no args lists the segments;
 
 `model.fallbacks` are tried in order when the primary free model is down or
 rate-limited (OpenRouter's `models` routing).
+
+## Platform support
+
+| | Linux | Windows | macOS |
+|---|---|---|---|
+| Files, search, edit, git, web, browser, Gmail, voice, terminal + desktop UI | yes | written to be portable, **not yet run** | written to be portable, **not yet run** |
+| App and window control (`open_app`, `close_app`, `list_windows`, ...) | yes (window control needs GNOME) | written + unit-tested, **not yet run on real Windows** (Start Menu apps, PowerShell windows) | written + unit-tested, **not yet run on a real Mac** (`.app` bundles, AppleScript; windows need Accessibility permission) |
+| Read-only command auto-approval | Unix commands | `dir`, `type`, `where`, `findstr`, ... | Unix commands |
+
+OS-specific code lives in `raven/platforms/`. Testers: `WINDOWS_TEST_CHECKLIST.md`,
+`MACOS_TEST_CHECKLIST.md`.
 
 ## Opening applications (Linux)
 

@@ -1,6 +1,8 @@
 """raven/llm_provider.py — RAVEN.md rules loading (B1) and OpenRouterProvider
 wiring. cwd/home are always passed explicitly here (never real Path.cwd()/
 Path.home()) so this suite can never accidentally pick up a real RAVEN.md."""
+import pytest
+
 from raven import llm_provider
 from raven.llm_provider import OpenRouterProvider, build_system_prompt, load_project_rules
 
@@ -209,3 +211,76 @@ def test_browser_skill_prompt_preserves_the_submit_safety_guardrail():
     prompt = llm_provider.SKILL_PROMPTS["browser"]
     assert "browser_submit" in prompt
     assert "isolated session" in prompt
+
+
+# ---------------------------------------------------------------------------
+# reply_with_image (V2): a separate, single-shot multimodal call
+# ---------------------------------------------------------------------------
+
+def test_reply_with_image_builds_the_multimodal_payload_and_uses_the_given_model(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        ok = True
+        def json(self):
+            return {"choices": [{"message": {"role": "assistant", "content": "a red circle"}}], "usage": {}}
+
+    def fake_post(url, headers, json, timeout):
+        captured["payload"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(llm_provider.requests, "post", fake_post)
+    provider = OpenRouterProvider(api_key="fake", model="text-only-model", system_prompt="BASE")
+    result = provider.reply_with_image("what is this?", "ZmFrZWJhc2U2NA==", "image/png", "vision-model")
+
+    assert result == "a red circle"
+    payload = captured["payload"]
+    assert payload["models"] == ["vision-model"]  # the GIVEN model, not provider.model
+    content = payload["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "what is this?"}
+    assert content[1]["image_url"]["url"] == "data:image/png;base64,ZmFrZWJhc2U2NA=="
+    # no system prompt at all in this call -- a single-shot analysis request,
+    # not part of R.A.V.E.N's own persona/history (same reasoning _compact() applies)
+    assert not any(m.get("role") == "system" for m in payload["messages"])
+
+
+def test_reply_with_image_updates_token_and_model_bookkeeping(monkeypatch):
+    class FakeResponse:
+        ok = True
+        def json(self):
+            return {"choices": [{"message": {"role": "assistant", "content": "x"}}],
+                     "usage": {"total_tokens": 42}, "model": "vision-model"}
+
+    monkeypatch.setattr(llm_provider.requests, "post", lambda **kw: FakeResponse())
+    provider = OpenRouterProvider(api_key="fake", system_prompt="BASE")
+    provider.reply_with_image("q", "aGk=", "image/png", "vision-model")
+    assert provider.total_tokens == 42
+    assert provider.last_model == "vision-model"
+
+
+def test_reply_with_image_propagates_a_failed_call(monkeypatch):
+    class FakeResponse:
+        ok = False
+        status_code = 429
+        text = "rate limited"
+
+    monkeypatch.setattr(llm_provider.requests, "post", lambda **kw: FakeResponse())
+    provider = OpenRouterProvider(api_key="fake", system_prompt="BASE")
+    with pytest.raises(RuntimeError, match="429"):
+        provider.reply_with_image("q", "aGk=", "image/png", "vision-model")
+
+
+def test_llm_provider_base_class_declares_reply_with_image_as_a_typed_but_unsupported_default():
+    """Regression guard for the same static-typing class of issue system_prompt
+    had: self.provider.reply_with_image must be a valid attribute access for
+    ANY LLMProvider subclass, not just OpenRouterProvider -- a subclass that
+    doesn't override it should still have a callable method (raising a
+    clear NotImplementedError), not an AttributeError from a missing method."""
+    class MinimalProvider(llm_provider.LLMProvider):
+        def reply(self, messages, tools=None):
+            return {"role": "assistant", "content": "hi"}
+
+    provider = MinimalProvider()
+    assert hasattr(provider, "reply_with_image")  # inherited from the ABC, always true
+    with pytest.raises(NotImplementedError, match="MinimalProvider does not support image analysis"):
+        provider.reply_with_image("q", "aGk=", "image/png", "vision-model")

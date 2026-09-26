@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from raven import tools
+from raven.platforms import linux
 
 
 # ---------------------------------------------------------------------------
@@ -87,15 +88,15 @@ def test_binary_name_flatpak_extracts_the_real_command_not_flatpak_itself(app_di
     """Before this fix, EVERY flatpak app resolved to the literal string
     'flatpak', so close_app('firefox') would have run `pkill -f flatpak` —
     matching and killing every running flatpak app, not just Firefox."""
-    assert tools._binary_name("org.mozilla.firefox") == "firefox"
+    assert linux._binary_name("org.mozilla.firefox") == "firefox"
 
 
 def test_binary_name_non_flatpak_app(app_dirs):
-    assert tools._binary_name("org.gnome.TextEditor") == "gnome-text-editor"
+    assert linux._binary_name("org.gnome.TextEditor") == "gnome-text-editor"
 
 
 def test_binary_name_unknown_app_id(app_dirs):
-    assert tools._binary_name("no-such-app") is None
+    assert linux._binary_name("no-such-app") is None
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +106,7 @@ def test_binary_name_unknown_app_id(app_dirs):
 def test_open_file_injects_reuse_window_flag_for_vs_code(app_dirs, tmp_path):
     target = tmp_path / "f.txt"
     target.write_text("x")
-    with patch.object(tools, "shutil") as mock_shutil, patch.object(tools, "subprocess") as mock_subprocess:
+    with patch.object(linux, "shutil") as mock_shutil, patch.object(linux, "subprocess") as mock_subprocess:
         mock_shutil.which.return_value = "/usr/bin/code"
         result = tools.open_file(str(target), app="visual studio code")
     args = mock_subprocess.Popen.call_args[0][0]
@@ -116,7 +117,7 @@ def test_open_file_injects_reuse_window_flag_for_vs_code(app_dirs, tmp_path):
 def test_open_file_other_apps_go_through_gtk_launch_unmodified(app_dirs, tmp_path):
     target = tmp_path / "f.txt"
     target.write_text("x")
-    with patch.object(tools, "shutil") as mock_shutil, patch.object(tools, "subprocess") as mock_subprocess:
+    with patch.object(linux, "shutil") as mock_shutil, patch.object(linux, "subprocess") as mock_subprocess:
         mock_shutil.which.return_value = "/usr/bin/gtk-launch"
         tools.open_file(str(target), app="code::blocks")
     args = mock_subprocess.Popen.call_args[0][0]
@@ -492,9 +493,10 @@ def test_run_tests_captures_stdout():
 def test_run_tests_defaults_to_pytest(monkeypatch):
     captured = {}
 
-    def fake_run(command, shell, capture_output, text, timeout):
+    def fake_run(command, shell, capture_output, text, timeout, stdin):
         captured["command"] = command
         captured["timeout"] = timeout
+        captured["stdin"] = stdin
         class R: stdout, stderr, returncode = "", "", 0
         return R()
 
@@ -503,6 +505,38 @@ def test_run_tests_defaults_to_pytest(monkeypatch):
     assert captured["command"] == "pytest"
     assert captured["timeout"] == tools.RUN_TESTS_TIMEOUT
     assert tools.RUN_TESTS_TIMEOUT > tools.RUN_COMMAND_TIMEOUT  # the whole point of a separate tool
+    assert captured["stdin"] == tools.subprocess.DEVNULL
+
+
+# ---------------------------------------------------------------------------
+# _run_shell stdin=DEVNULL (real bug, found live 2026-09-24): without it, a
+# command that reads stdin (python3, ssh, sudo, git commit with no -m, ...)
+# inherits R.A.V.E.N's own stdin -- the user's real terminal in interactive
+# mode -- and blocks forever, in a way even Ctrl+C couldn't recover from
+# (prompt_toolkit already owns the terminal in its own raw input mode).
+# The actual hang-and-fix was reproduced live with a real pty before this
+# fix was written (see DEV_LOG) -- that reproduction isn't repeated here as
+# a routine test, since it requires reassigning the TEST PROCESS's own stdin
+# fd to prove anything, which is too invasive/risky to do routinely inside
+# the main suite (real risk of corrupting pytest's own I/O if anything goes
+# wrong). What's safe and still meaningful to assert on every run: the
+# actual subprocess.run call unconditionally includes stdin=DEVNULL, for
+# every one of _run_shell's callers, not just one.
+# ---------------------------------------------------------------------------
+
+def test_run_command_and_run_tests_and_git_all_pass_stdin_devnull(monkeypatch):
+    calls = []
+
+    def fake_run(command, shell, capture_output, text, timeout, stdin):
+        calls.append(stdin)
+        class R: stdout, stderr, returncode = "", "", 0
+        return R()
+
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    tools.run_command("echo hi")
+    tools.run_tests()
+    tools.git("status")
+    assert calls == [tools.subprocess.DEVNULL] * 3
 
 
 # ---------------------------------------------------------------------------
@@ -538,3 +572,23 @@ def test_core_includes_the_coding_essentials():
     for name in ("read_file", "write_file", "edit_file", "grep", "glob_files",
                  "tree", "run_command", "run_tests", "git", "save_note"):
         assert name in core
+
+
+# ---------------------------------------------------------------------------
+# analyze_image / browser_screenshot (V2): analyze_image is registered as a
+# placeholder only -- Assistant._run_tool intercepts it before it ever runs.
+# ---------------------------------------------------------------------------
+
+def test_analyze_image_placeholder_never_actually_runs():
+    """If this DOES run, the interception in Assistant._run_tool was
+    skipped somehow -- it should fail loudly and clearly, not silently."""
+    with pytest.raises(RuntimeError, match="must be handled by Assistant"):
+        tools.analyze_image("x.png", "what is this?")
+
+
+def test_vision_skill_contains_analyze_image():
+    assert "analyze_image" in tools.SKILLS["vision"]
+
+
+def test_browser_skill_contains_screenshot():
+    assert "browser_screenshot" in tools.SKILLS["browser"]

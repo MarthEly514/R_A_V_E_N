@@ -1,10 +1,8 @@
 """Execution primitives: file I/O and shell commands."""
-import ast
 import difflib
 import html
 import json
 import re
-import shutil
 import subprocess
 import webbrowser
 from pathlib import Path
@@ -14,16 +12,8 @@ import requests
 
 from raven import browser as _browser
 from raven import gmail as _gmail
+from raven import platforms
 from raven.config import NOTES_PATH
-
-APP_DIRS = [
-    Path("/usr/share/applications"),
-    Path("/usr/local/share/applications"),
-    Path.home() / ".local/share/applications",
-    Path("/var/lib/flatpak/exports/share/applications"),  # system-wide flatpak installs
-    Path.home() / ".local/share/flatpak/exports/share/applications",  # per-user flatpak installs
-    Path("/var/lib/snapd/desktop/applications"),  # snap installs
-]
 
 _HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RAVEN-agent/1.0)"}
 
@@ -97,6 +87,24 @@ def save_note(note: str) -> str:
                 f"Ask the user before removing old notes to make room.")
     NOTES_PATH.write_text(existing + line)
     return f"Saved note: {note}"
+
+
+def analyze_image(path: str, question: str = "Describe this image.") -> str:
+    """Placeholder only (V2) -- Assistant._run_tool intercepts this tool
+    name BEFORE it ever reaches TOOL_FUNCTIONS, the same way load_skill is
+    intercepted, since it needs a live provider to make a real vision-model
+    call, which a plain tool function has no access to. Registered here
+    anyway (spec + this placeholder) so it flows through the normal skill
+    gating (tools.SKILLS/core_tool_names) and registry-completeness checks
+    like every other tool, rather than needing its own special case there
+    too -- the special case is confined to _run_tool's dispatch, nowhere
+    else. Should never actually execute; if it does, the interception in
+    assistant.py was skipped somehow, and this says so plainly instead of
+    silently doing the wrong thing."""
+    raise RuntimeError(
+        "analyze_image must be handled by Assistant (it needs a live provider for the "
+        "real vision-model call) -- this placeholder should never run directly."
+    )
 
 
 def list_dir(path: str = ".") -> str:
@@ -261,7 +269,23 @@ RUN_TESTS_TIMEOUT = 120
 
 
 def _run_shell(command: str, timeout: int) -> str:
-    result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+    # stdin=DEVNULL is load-bearing, not decoration: without it, subprocess.run
+    # inherits R.A.V.E.N's own stdin -- the user's REAL terminal in interactive
+    # mode. Any command that tries to read input (python3 with no args, ssh,
+    # sudo, git commit with no -m, less/vim/nano, a bare `read` in a script,
+    # ...) then blocks reading from that terminal, and since prompt_toolkit
+    # already owns the terminal in its own raw input mode for its own
+    # line-editing, a stray Ctrl+C doesn't reach the blocked subprocess as a
+    # normal SIGINT the way it would in a plain shell -- the whole session can
+    # appear to hang completely, unrecoverably, well past whatever `timeout`
+    # is set to (confirmed live: reproduced the exact hang via a real pty,
+    # confirmed DEVNULL fixes it in ~5ms instead of blocking for the full
+    # timeout). No legitimate run_command/run_tests/git use case needs
+    # interactive stdin -- the model can't type into it, so there was never
+    # a good reason to leave this open.
+    result = subprocess.run(
+        command, shell=True, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+    )
     output = result.stdout + result.stderr
     return _truncate(output.strip()) or f"(exited {result.returncode}, no output)"
 
@@ -355,36 +379,10 @@ def web_search(query: str) -> str:
     return "\n".join(lines)
 
 
-def _installed_apps() -> dict[str, str]:
-    """Lowercase app display name -> .desktop id, from standard app directories."""
-    apps = {}
-    for directory in APP_DIRS:
-        if not directory.is_dir():
-            continue
-        for desktop_file in directory.glob("*.desktop"):
-            try:
-                lines = desktop_file.read_text(errors="ignore").splitlines()
-            except OSError:
-                continue
-            name, no_display, sections_seen = None, False, 0
-            for line in lines:
-                if line.startswith("["):
-                    sections_seen += 1
-                    if sections_seen > 1:  # left the [Desktop Entry] section
-                        break
-                elif line.startswith("Name=") and name is None:
-                    name = line.split("=", 1)[1].strip()
-                elif line.strip() == "NoDisplay=true":
-                    no_display = True
-            if name and not no_display:
-                apps[name.lower()] = desktop_file.stem
-    return apps
-
-
 def list_apps() -> str:
     """List every installed application's display name, so the caller can pick
     the exact one to pass to open_app/open_file instead of guessing."""
-    apps = _installed_apps()
+    apps = platforms.current().installed_apps()
     return "\n".join(sorted(n.title() for n in apps)) or "(no apps found)"
 
 
@@ -398,8 +396,8 @@ def _contains_words(haystack: str, needle: str) -> bool:
 
 
 def _match_app(name: str) -> tuple[str, str] | str:
-    """Resolve a (fuzzy) app name to (display name, .desktop id), or an error string."""
-    apps = _installed_apps()
+    """Resolve a (fuzzy) app name to (display name, app id), or an error string."""
+    apps = platforms.current().installed_apps()
     query = name.strip().lower()
     # Word-containment works both ways, so extra words ("the text editor app") or a
     # shorter query ("editor") both still find "text editor".
@@ -420,66 +418,14 @@ def _match_app(name: str) -> tuple[str, str] | str:
     return matched_name, apps[matched_name]
 
 
-def _binary_name(app_id: str) -> str | None:
-    """The executable name from an app's Exec= line (its process name, for closing it)."""
-    for directory in APP_DIRS:
-        desktop_file = directory / f"{app_id}.desktop"
-        if not desktop_file.is_file():
-            continue
-        try:
-            for line in desktop_file.read_text(errors="ignore").splitlines():
-                if line.startswith("Exec="):
-                    cmd = line.split("=", 1)[1].strip().split()
-                    if not cmd:
-                        return None
-                    name = Path(cmd[0]).name
-                    if name == "flatpak":
-                        # Exec is "flatpak run ... --command=<real binary> ... <app-id> ...",
-                        # so the naive first token is always "flatpak" — useless for pkill,
-                        # since it'd match every running flatpak app, not just this one.
-                        # Confirmed against a real running process: --command's value is
-                        # exactly what shows up in `ps` (e.g. --command=firefox -> the
-                        # actual /app/lib/firefox/firefox process). Fall back to the
-                        # app-id itself if --command= isn't present.
-                        command_arg = next(
-                            (a[len("--command="):] for a in cmd if a.startswith("--command=")),
-                            None,
-                        )
-                        return command_arg or app_id
-                    return name
-        except OSError:
-            continue
-    return None
-
-
-# Some single-instance apps default their CLI to opening a brand-new window per
-# invocation rather than reusing the one already open. Extra args listed here
-# (keyed by .desktop id) fix that, so R.A.V.E.N opening a file on your behalf
-# doesn't pile up windows. Add an entry here if another app needs the same fix.
-REUSE_WINDOW_ARGS = {
-    "code": ["-r"],  # VS Code: -r/--reuse-window, opens into the last active window
-}
-
-
-def _gtk_launch(app_id: str, *args: str) -> None:
-    subprocess.Popen(
-        ["gtk-launch", app_id, *args],
-        start_new_session=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
 def open_app(name: str) -> str:
     """Launch an installed desktop application by (fuzzy) name."""
     match = _match_app(name)
     if isinstance(match, str):
         return match
-    if not shutil.which("gtk-launch"):
-        return "Can't launch apps: gtk-launch is not installed."
     matched_name, app_id = match
-    _gtk_launch(app_id)
-    return f"Launched {matched_name.title()}."
+    error = platforms.current().launch(app_id)
+    return error or f"Launched {matched_name.title()}."
 
 
 def _launch_app_with_target(app: str, target: str, label: str) -> str:
@@ -490,21 +436,8 @@ def _launch_app_with_target(app: str, target: str, label: str) -> str:
     if isinstance(match, str):
         return match
     matched_name, app_id = match
-    extra_args = REUSE_WINDOW_ARGS.get(app_id)
-    binary = _binary_name(app_id) if extra_args else None
-    if extra_args and binary and shutil.which(binary):
-        # Bypass gtk-launch's %F template substitution here: it's undocumented
-        # whether a non-file flag like "-r" survives that substitution alongside
-        # the target, so invoke the real binary directly for a guaranteed argv.
-        subprocess.Popen(
-            [binary, *extra_args, target],
-            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        return f"Opened {label} in {matched_name.title()}."
-    if not shutil.which("gtk-launch"):
-        return "Can't launch apps: gtk-launch is not installed."
-    _gtk_launch(app_id, target)
-    return f"Opened {label} in {matched_name.title()}."
+    error = platforms.current().launch(app_id, target)
+    return error or f"Opened {label} in {matched_name.title()}."
 
 
 def open_file(path: str, app: str = "") -> str:
@@ -513,102 +446,61 @@ def open_file(path: str, app: str = "") -> str:
     if not target.exists():
         return f"No such file: {path}"
     if not app:
-        if not shutil.which("xdg-open"):
-            return "Can't open files: xdg-open is not installed."
-        subprocess.Popen(
-            ["xdg-open", str(target)],
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return f"Opened {path} with the default app."
+        error = platforms.current().open_default(str(target))
+        return error or f"Opened {path} with the default app."
     return _launch_app_with_target(app, str(target), path)
 
 
 def close_app(name: str) -> str:
     """Close a running application by (fuzzy) name. Requires user confirmation.
 
-    This closes by process signal (pkill -f <binary>), so it ALWAYS closes every
-    window of the app at once. To close just one window, use close_window
-    instead (needs the "Window Calls" GNOME Shell extension — see its docstring)."""
+    Closes EVERY window of the app at once. To close just one window, use
+    close_window instead (needs OS window-control support -- on Linux, the
+    "Window Calls" GNOME Shell extension)."""
     match = _match_app(name)
     if isinstance(match, str):
         return match
     matched_name, app_id = match
-    binary = _binary_name(app_id)
-    if not binary:
-        return f"Couldn't determine the process for {matched_name.title()}."
-    result = subprocess.run(["pkill", "-f", binary], capture_output=True, text=True)
-    if result.returncode == 0:
-        return f"Closed {matched_name.title()} (all of its windows)."
-    if result.returncode == 1:
-        return f"{matched_name.title()} does not appear to be running."
-    return f"Couldn't close {matched_name.title()}: {result.stderr.strip() or 'pkill error'}"
-
-
-def _window_calls(method: str, *args: str) -> str:
-    """Call a method on the "Window Calls" GNOME Shell extension's D-Bus
-    interface (org.gnome.Shell.Extensions.Windows) and return its raw string
-    result. Raises RuntimeError with a clear cause if the extension isn't
-    installed/enabled or the call otherwise fails."""
-    if not shutil.which("gdbus"):
-        raise RuntimeError("gdbus is not installed")
-    result = subprocess.run(
-        ["gdbus", "call", "--session", "--dest", "org.gnome.Shell",
-         "--object-path", "/org/gnome/Shell/Extensions/Windows",
-         "--method", f"org.gnome.Shell.Extensions.Windows.{method}", *args],
-        capture_output=True, text=True, timeout=10,
-    )
-    if result.returncode != 0:
-        err = result.stderr.strip()
-        if "org.freedesktop.DBus.Error.UnknownMethod" in err or "No such interface" in err:
-            raise RuntimeError('the "Window Calls" GNOME Shell extension is not installed/enabled')
-        raise RuntimeError(err or "gdbus call failed")
-    # gdbus prints a Python-tuple-literal, e.g. ('the returned string',) for a
-    # method with a return value, or () for a void one like Close.
-    parsed = ast.literal_eval(result.stdout.strip())
-    return parsed[0] if parsed else ""
+    return platforms.current().close_app(app_id, matched_name)
 
 
 def list_windows() -> str:
     """List every open window: id, owning app, and title. Use this to find a
-    window's id/title before calling close_window on it. Requires the "Window
-    Calls" GNOME Shell extension (github.com/ickyicky/window-calls); if it's
-    not installed/enabled, says so plainly instead of failing silently."""
+    window's id/title before calling close_window on it. If window control isn't
+    available (unsupported OS, missing extension/permission), says so plainly
+    instead of failing silently."""
     try:
-        windows = json.loads(_window_calls("List"))
-    except (RuntimeError, subprocess.TimeoutExpired, ValueError) as e:
+        windows = platforms.current().list_windows()
+    except platforms.WindowControlError as e:
         return f"Can't list windows: {e}."
     if not windows:
         return "(no windows found)"
-    return "\n".join(
-        f"{w.get('id')} | {w.get('wm_class', '?')} | {w.get('title', '')}" for w in windows
-    )
+    return "\n".join(f"{w['id']} | {w['app']} | {w['title']}" for w in windows)
 
 
 def close_window(title: str) -> str:
     """Close exactly one window, matched by a case-insensitive substring of its
     title (see list_windows for the exact titles). Requires user confirmation.
     Unlike close_app (which always closes an app's every window), this closes
-    only the one matching window — a real per-window close, using the "Window
-    Calls" GNOME Shell extension. If it's not installed/enabled, says so."""
+    only the one matching window. If window control isn't available, says so."""
+    backend = platforms.current()
     try:
-        windows = json.loads(_window_calls("List"))
-    except (RuntimeError, subprocess.TimeoutExpired, ValueError) as e:
+        windows = backend.list_windows()
+    except platforms.WindowControlError as e:
         return f"Can't close window: {e}."
     query = title.strip().lower()
     matches = [w for w in windows if query in (w.get("title") or "").lower()]
     if not matches:
         return f"No open window matches '{title}'. Call list_windows to see what's open."
     if len(matches) > 1:
-        candidates = "; ".join(f"{w.get('id')}: {w.get('title')}" for w in matches[:10])
+        candidates = "; ".join(f"{w['id']}: {w['title']}" for w in matches[:10])
         return f"Multiple windows match '{title}': {candidates}. Be more specific."
     win = matches[0]
     try:
-        _window_calls("Close", str(win["id"]))
-    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        backend.close_window(win["id"])
+    except platforms.WindowControlError as e:
         return f"Couldn't close window: {e}."
-    return f"Closed window: {win.get('title')}"
+    return f"Closed window: {win['title']}"
 
 
 TOOL_FUNCTIONS = {
@@ -640,6 +532,8 @@ TOOL_FUNCTIONS = {
     "browser_type": _browser.type_text,
     "browser_submit": _browser.submit,
     "browser_close": _browser.close,
+    "browser_screenshot": _browser.screenshot,
+    "analyze_image": analyze_image,
     "gmail_list_messages": _gmail.list_messages,
     "gmail_read_message": _gmail.read_message,
     "gmail_send_message": _gmail.send_message,
@@ -919,6 +813,25 @@ TOOL_SPECS = [
         "parameters": {"type": "object", "properties": {}},
     }},
     {"type": "function", "function": {
+        "name": "browser_screenshot",
+        "description": "Save a screenshot (PNG) of the current browser page to a temp file and "
+                       "return its path. Capture only — follow up with analyze_image(path, "
+                       "question) to actually see/interpret what's in it. No confirmation needed.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "analyze_image",
+        "description": "Look at an image file (a screenshot, photo, or diagram) and answer a "
+                       "question about it, using a separate vision-capable model. Use this "
+                       "whenever a request needs you to actually SEE something, not just read "
+                       "text about it. No confirmation needed (read-only).",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Path to the image file"},
+            "question": {"type": "string",
+                        "description": "What to answer about the image (default: describe it)"}},
+            "required": ["path"]},
+    }},
+    {"type": "function", "function": {
         "name": "gmail_list_messages",
         "description": "List the user's recent Gmail messages (id, date, sender, subject), "
                        "optionally filtered by a Gmail search query (e.g. 'is:unread', "
@@ -975,14 +888,20 @@ SKILLS = {
     "desktop": ["open_app", "open_file", "close_app", "list_windows", "close_window", "list_apps"],
     "web": ["open_url", "fetch_url", "web_search"],
     "browser": ["browser_navigate", "browser_read", "browser_click", "browser_type",
-                "browser_submit", "browser_close"],
+                "browser_submit", "browser_close", "browser_screenshot"],
     "gmail": ["gmail_list_messages", "gmail_read_message", "gmail_send_message", "gmail_reply_message"],
+    # V2: separate from "browser" deliberately -- analyze_image works on ANY
+    # image (a screenshot, a photo, a diagram the user points to), not just
+    # a browser_screenshot capture. A browser-screenshot-then-analyze
+    # workflow needs both skills loaded; each stays single-purpose.
+    "vision": ["analyze_image"],
 }
 SKILL_DESCRIPTIONS = {
     "desktop": "open/close desktop applications and windows",
     "web": "open a URL, fetch a page's text, search the web",
-    "browser": "navigate/read/click/type/submit in a real, interactive browser session",
+    "browser": "navigate/read/click/type/submit/screenshot in a real, interactive browser session",
     "gmail": "read, send, and reply to the user's Gmail",
+    "vision": "look at an image file and answer a question about it",
 }
 
 

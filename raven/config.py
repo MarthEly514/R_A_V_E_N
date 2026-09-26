@@ -15,6 +15,15 @@ DEFAULT_SETTINGS = {
     "model": {
         "name": "nvidia/nemotron-3.5-lightning:free",
         "fallbacks": ["google/gemma-4-31b-it:free", "openrouter/free"],
+        # V2: a SEPARATE model for analyze_image -- the main chat model above
+        # isn't necessarily vision-capable, and a model that IS vision-capable
+        # isn't necessarily the best (or free) choice for everything else, so
+        # this is its own setting rather than reusing model.name. NOT yet
+        # live-verified as of 2026-09-23 (OpenRouter's daily free-tier quota
+        # was exhausted before this could be confirmed against a real call) --
+        # check this is still current/free the first time vision is actually
+        # used, and update here (or in settings.json) if it's moved on.
+        "vision": "qwen/qwen2.5-vl-32b-instruct:free",
     },
     # Status-line segments, in display order. Available names live in statusline.SEGMENTS.
     "statusline": {"segments": ["model", "context", "tokens", "memory"]},

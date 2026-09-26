@@ -57,3 +57,24 @@ def test_submit_actually_submits(fresh_page):
 def test_submit_unknown_element(fresh_page):
     result = fresh_page.submit("Not A Real Button")
     assert "No visible element matches" in result
+
+
+# ---------------------------------------------------------------------------
+# screenshot (V2)
+#
+# Same deliberate gap already stated for _read()'s "No page loaded yet"
+# branch (Step 3.24): the shared session fixture always navigates before
+# first use, so that branch is never actually hit here, and closing the
+# shared browser mid-suite just to hit one string would break the "paid
+# once per run" fixture this whole file relies on. Not worth it for one
+# string, consistent with the earlier call on the same tradeoff.
+# ---------------------------------------------------------------------------
+
+def test_screenshot_saves_a_real_png_file(fresh_page):
+    import os
+    path = fresh_page.screenshot()
+    assert os.path.isfile(path)
+    assert os.path.getsize(path) > 0
+    with open(path, "rb") as f:
+        assert f.read(8) == b"\x89PNG\r\n\x1a\n"  # real PNG magic bytes -- not just a placeholder
+    os.remove(path)

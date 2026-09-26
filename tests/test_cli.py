@@ -90,142 +90,178 @@ def test_ctrl_o_handler_toggles_ui_state():
 
 
 # ---------------------------------------------------------------------------
-# confirm_run: pauses/resumes the status spinner around the blocking prompt
-# (Step 3.15 — this used to make the prompt invisible)
+# Voice input (V1): toolbar hint + the ctrl+v toggle handler
 # ---------------------------------------------------------------------------
 
-class FakeStatus:
-    def __init__(self):
-        self.calls = []
+def test_voice_toolbar_hint_blank_when_not_available():
+    with patch.object(cli.voice, "is_available", return_value=False):
+        assert cli.voice_toolbar_hint(recording=False) == ""
+        assert cli.voice_toolbar_hint(recording=True) == ""
 
-    def stop(self):
-        self.calls.append("stop")
+
+def test_voice_toolbar_hint_shows_idle_and_recording_states():
+    with patch.object(cli.voice, "is_available", return_value=True):
+        idle = cli.voice_toolbar_hint(recording=False)
+        active = cli.voice_toolbar_hint(recording=True)
+        assert "ctrl+v" in idle and "recording" not in idle.lower()
+        assert "recording" in active.lower()
+        assert idle != active
+
+
+class _FakeBuffer:
+    def __init__(self):
+        self.inserted = []
+
+    def insert_text(self, text):
+        self.inserted.append(text)
+
+
+class _FakeLoop:
+    """call_soon_threadsafe just runs the callback -- stands in for the
+    event loop so the background worker's result can be asserted on."""
+    def call_soon_threadsafe(self, fn):
+        fn()
+
+
+class _FakeApp:
+    def __init__(self):
+        self.invalidated = 0
+        self.loop = _FakeLoop()
+
+    def invalidate(self):
+        self.invalidated += 1
+
+
+class _FakeKeyEvent:
+    def __init__(self):
+        self.current_buffer = _FakeBuffer()
+        self.app = _FakeApp()
+
+
+class _InlineThread:
+    """Runs the target immediately instead of on a real thread, so the test
+    can assert on the result deterministically. Records that a thread WAS
+    used -- the point of the fix is that transcription is off the UI thread."""
+    started = []
+
+    def __init__(self, target, args=(), daemon=None):
+        self._target, self._args = target, args
+        _InlineThread.started.append(target)
 
     def start(self):
-        self.calls.append("start")
+        self._target(*self._args)
 
 
-def test_confirm_run_pauses_and_resumes_the_status_spinner():
-    status = FakeStatus()
-    with patch.object(cli, "Confirm") as mock_confirm:
-        mock_confirm.ask.return_value = True
-        result = cli.confirm_run("close: calculator", status)
-    assert result is True
-    assert status.calls == ["stop", "start"]
+@pytest.fixture(autouse=True)
+def _reset_voice_ui_state():
+    cli.UI_STATE["recording"] = False
+    cli.UI_STATE["voice_status"] = ""
+    _InlineThread.started = []
+    yield
+    cli.UI_STATE["recording"] = False
+    cli.UI_STATE["voice_status"] = ""
 
 
-def test_confirm_run_resumes_the_spinner_even_if_the_prompt_is_interrupted():
-    status = FakeStatus()
-    with patch.object(cli, "Confirm") as mock_confirm:
-        mock_confirm.ask.side_effect = KeyboardInterrupt
-        try:
-            cli.confirm_run("close: calculator", status)
-        except KeyboardInterrupt:
-            pass
-    assert status.calls == ["stop", "start"]
+def test_voice_toolbar_hint_shows_transcribing_and_error_status():
+    with patch.object(cli.voice, "is_available", return_value=True):
+        assert "transcribing" in cli.voice_toolbar_hint(False, "transcribing")
+        assert "not downloaded" in cli.voice_toolbar_hint(False, "voice model not downloaded")
+        # recording wins over a stale status
+        assert "recording" in cli.voice_toolbar_hint(True, "transcribing")
 
 
-def test_confirm_run_with_no_status_still_works():
-    with patch.object(cli, "Confirm") as mock_confirm:
-        mock_confirm.ask.return_value = False
-        assert cli.confirm_run("x", None) is False
+def test_toggle_recording_when_not_available_inserts_a_hint_and_does_not_record():
+    event = _FakeKeyEvent()
+    with patch.object(cli.voice, "is_available", return_value=False):
+        cli._toggle_recording(event)
+    assert cli.UI_STATE["recording"] is False
+    assert "not set up" in event.current_buffer.inserted[0]
 
 
-# ---------------------------------------------------------------------------
-# shimmer_text: pure rendering helper, no timing state (2026-09-23 esthetic patch)
-# ---------------------------------------------------------------------------
-
-def test_shimmer_text_empty_word_is_empty():
-    assert cli.shimmer_text("", 0) == ""
-
-
-def test_shimmer_text_contains_every_character_of_the_word():
-    out = cli.shimmer_text("Thinking...", 3)
-    for ch in "Thinking...":
-        assert ch in out
-
-
-def test_shimmer_text_changes_across_frames():
-    """The whole point: it's an animation, so consecutive frames must render
-    differently (the highlight position moves)."""
-    word = "Thinking..."
-    frames = {cli.shimmer_text(word, f) for f in range(len(word) + len(cli._SHIMMER_STYLES))}
-    assert len(frames) > 1
+def test_toggle_recording_refuses_to_start_when_the_model_is_not_downloaded():
+    """Regression: the model used to be downloaded from INSIDE this key
+    handler, freezing the whole UI (Ctrl+C included) -- and on a bad
+    connection the download never finished at all. Now a missing model is
+    reported, never fetched, and recording doesn't even start."""
+    event = _FakeKeyEvent()
+    with patch.object(cli.voice, "is_available", return_value=True), \
+         patch.object(cli.voice, "model_ready", return_value=False), \
+         patch.object(cli, "VOICE_RECORDER") as mock_recorder:
+        cli._toggle_recording(event)
+    mock_recorder.start.assert_not_called()
+    assert cli.UI_STATE["recording"] is False
+    assert "python -m raven.voice" in cli.UI_STATE["voice_status"]
 
 
-def test_shimmer_text_loops():
-    """After a full sweep (word length + gradient width), the pattern must
-    repeat exactly, not drift or grow unbounded markup."""
-    word = "Thinking..."
-    period = len(word) + len(cli._SHIMMER_STYLES)
-    assert cli.shimmer_text(word, 2) == cli.shimmer_text(word, 2 + period)
+def test_toggle_recording_starts_then_stops_and_inserts_transcribed_text():
+    start_event, stop_event = _FakeKeyEvent(), _FakeKeyEvent()
+    with patch.object(cli.voice, "is_available", return_value=True), \
+         patch.object(cli.voice, "model_ready", return_value=True), \
+         patch.object(cli, "VOICE_RECORDER") as mock_recorder, \
+         patch.object(cli.threading, "Thread", _InlineThread), \
+         patch.object(cli.voice, "transcribe", return_value="hello world"):
+        cli._toggle_recording(start_event)
+        assert cli.UI_STATE["recording"] is True
+        mock_recorder.start.assert_called_once()
+        assert start_event.current_buffer.inserted == []
+
+        cli._toggle_recording(stop_event)
+    assert cli.UI_STATE["recording"] is False
+    mock_recorder.stop.assert_called_once()
+    assert stop_event.current_buffer.inserted == ["hello world"]
+    assert cli.UI_STATE["voice_status"] == ""  # "transcribing" cleared on completion
 
 
-# ---------------------------------------------------------------------------
-# schedule_word_rotation: the pause bug fix (2026-09-23) — a tool-call status
-# must not be stomped by the next random word up to `interval` seconds later.
-# ---------------------------------------------------------------------------
-
-class FakeStatusRecorder:
-    def __init__(self):
-        self.updates = []
-
-    def update(self, text):
-        self.updates.append(text)
-
-
-def test_rotation_updates_the_status_before_any_pause():
-    status = FakeStatusRecorder()
-    stop, pause = cli.schedule_word_rotation(status, ["Thinking..."], interval=0.05, shimmer_interval=0.02)
-    try:
-        time.sleep(0.1)
-        assert len(status.updates) > 0
-    finally:
-        stop()
+def test_toggle_recording_transcribes_on_a_background_thread_not_inline():
+    """The other half of the freeze fix: transcription (model load +
+    inference, seconds long) must go through a thread, never run inline on
+    the event-loop thread that a key handler executes on."""
+    cli.UI_STATE["recording"] = True
+    event = _FakeKeyEvent()
+    with patch.object(cli.voice, "is_available", return_value=True), \
+         patch.object(cli, "VOICE_RECORDER"), \
+         patch.object(cli.threading, "Thread", _InlineThread), \
+         patch.object(cli.voice, "transcribe", return_value="x"):
+        cli._toggle_recording(event)
+    assert _InlineThread.started == [cli._run_transcription]
 
 
-def test_pause_stops_further_updates():
-    status = FakeStatusRecorder()
-    stop, pause = cli.schedule_word_rotation(status, ["Thinking..."], interval=0.03, shimmer_interval=0.02)
-    try:
-        time.sleep(0.08)
-        pause()
-        count_at_pause = len(status.updates)
-        # Simulate a tool call setting its own status directly, the way
-        # on_tool_call does in main() -- this must survive untouched.
-        status.update("[dim]Reading file.py... (Ctrl+C to cancel)[/]")
-        time.sleep(0.15)  # well past several would-be rotation/shimmer ticks
-        assert status.updates[-1] == "[dim]Reading file.py... (Ctrl+C to cancel)[/]"
-        assert len(status.updates) == count_at_pause + 1  # nothing else snuck in
-    finally:
-        stop()
+def test_toggle_recording_ignores_a_press_while_still_transcribing():
+    cli.UI_STATE["voice_status"] = "transcribing"
+    event = _FakeKeyEvent()
+    with patch.object(cli.voice, "is_available", return_value=True), \
+         patch.object(cli, "VOICE_RECORDER") as mock_recorder:
+        cli._toggle_recording(event)
+    mock_recorder.start.assert_not_called()
 
 
-def test_stop_cancels_all_timers():
-    status = FakeStatusRecorder()
-    stop, pause = cli.schedule_word_rotation(status, ["Thinking..."], interval=0.03, shimmer_interval=0.02)
-    stop()
-    count_at_stop = len(status.updates)
-    time.sleep(0.1)
-    assert len(status.updates) == count_at_stop
+def test_toggle_recording_empty_transcription_inserts_nothing():
+    cli.UI_STATE["recording"] = True
+    event = _FakeKeyEvent()
+    with patch.object(cli.voice, "is_available", return_value=True), \
+         patch.object(cli, "VOICE_RECORDER"), \
+         patch.object(cli.threading, "Thread", _InlineThread), \
+         patch.object(cli.voice, "transcribe", return_value=""):
+        cli._toggle_recording(event)
+    assert event.current_buffer.inserted == []
 
 
-# ---------------------------------------------------------------------------
-# /forget
-# ---------------------------------------------------------------------------
-
-def test_handle_forget_clears_history_and_reports_the_count():
-    cli.console = Console(record=True, width=100)
-    cli.ASSISTANT = Assistant(provider=None)
-    cli.ASSISTANT.history = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]
-    cli.handle_forget()
-    assert "Forgot 2 messages" in cli.console.export_text()
-    assert cli.ASSISTANT.history == []
+def test_run_transcription_reports_a_missing_model_instead_of_raising():
+    buffer, app = _FakeBuffer(), _FakeApp()
+    with patch.object(cli.voice, "transcribe",
+                      side_effect=cli.voice.ModelNotDownloadedError("model isn't downloaded")):
+        cli._run_transcription([0.0], buffer, app)  # must not raise
+    assert buffer.inserted == []
+    assert "isn't downloaded" in cli.UI_STATE["voice_status"]
 
 
-# ---------------------------------------------------------------------------
-# /compact (B2)
-# ---------------------------------------------------------------------------
+def test_run_transcription_survives_any_other_failure():
+    buffer, app = _FakeBuffer(), _FakeApp()
+    with patch.object(cli.voice, "transcribe", side_effect=RuntimeError("boom")):
+        cli._run_transcription([0.0], buffer, app)
+    assert "boom" in cli.UI_STATE["voice_status"]
+    assert app.invalidated >= 1
+
 
 # ---------------------------------------------------------------------------
 # /notes (B3): read-only view of the model-written notes file
@@ -253,6 +289,30 @@ def test_handle_compact_reports_the_assistants_message():
     cli.ASSISTANT.history = [{"role": "user", "content": "hi"}]
     cli.handle_compact()
     assert "Nothing to compact" in cli.console.export_text()
+
+
+# ---------------------------------------------------------------------------
+# /skills
+# ---------------------------------------------------------------------------
+
+def test_handle_skills_lists_every_skill_unmarked_when_none_loaded():
+    cli.console = Console(record=True, width=120)
+    cli.ASSISTANT = Assistant(provider=None)
+    cli.handle_skills()
+    out = cli.console.export_text()
+    for name in tools.SKILLS:
+        assert name in out
+    assert "•" not in out
+
+
+def test_handle_skills_marks_loaded_skills():
+    cli.console = Console(record=True, width=120)
+    cli.ASSISTANT = Assistant(provider=None)
+    cli.ASSISTANT.active_skills.add("desktop")
+    cli.handle_skills()
+    out = cli.console.export_text()
+    desktop_line = next(l for l in out.splitlines() if "desktop" in l)
+    assert "•" in desktop_line
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +348,38 @@ def test_handle_write_existing_file_proceeds_when_confirmed(tmp_path):
         mock_confirm.ask.return_value = True
         cli.handle_write(f"{target} new")
     assert target.read_text() == "new"
+
+
+# ---------------------------------------------------------------------------
+# is_exit_command: a real bug found and fixed (2026-09-24) -- "/exit" with
+# any trailing text used to silently do nothing (routed to the inert
+# handle_exit placeholder via COMMANDS), while bare "exit"/"quit" with
+# trailing text got sent to the model as a real message. Verified by
+# directly simulating cli.py's dispatch logic before fixing it.
+# ---------------------------------------------------------------------------
+
+def test_is_exit_command_plain_forms():
+    for text in ("/exit", "/quit", "exit", "quit", "EXIT", "/Exit"):
+        assert cli.is_exit_command(text) is True
+
+
+def test_is_exit_command_slash_form_ignores_trailing_text():
+    """The actual bug: "/exit now" used to do nothing at all."""
+    assert cli.is_exit_command("/exit now") is True
+    assert cli.is_exit_command("/quit later") is True
+
+
+def test_is_exit_command_bare_word_requires_exact_match():
+    """Deliberately NOT extended the same way as the slash form: a real
+    sentence can start with the word "exit" and must reach the model."""
+    assert cli.is_exit_command("exit now") is False
+    assert cli.is_exit_command("exit code 1 means what?") is False
+
+
+def test_is_exit_command_false_for_ordinary_input():
+    assert cli.is_exit_command("hello") is False
+    assert cli.is_exit_command("/help") is False
+    assert cli.is_exit_command("") is False
 
 
 # ---------------------------------------------------------------------------

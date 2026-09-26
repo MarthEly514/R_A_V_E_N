@@ -17,6 +17,8 @@ on the next prompt (RuntimeError: asyncio.run() cannot be called from a
 running event loop). Confining Playwright to its own thread fixes both.
 """
 import atexit
+import os
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 from playwright.sync_api import sync_playwright
@@ -94,6 +96,23 @@ def _read() -> str:
     return f'{page.url} — "{page.title()}"\n{text}'
 
 
+def _screenshot() -> str:
+    """Save a PNG of the current page to a throwaway temp file, return its
+    path (V2, vision skill) -- a single synchronous Playwright call, unlike
+    a real DESKTOP screenshot (deferred, see DEV_LOG Stage V: that needs the
+    XDG portal's async request/signal dance, real added complexity this
+    doesn't need since Playwright already owns the page). The caller is
+    expected to follow up with analyze_image(path, question) -- this tool
+    only captures, it doesn't interpret."""
+    page = _ensure_page()
+    if page.url == "about:blank":
+        return "No page loaded yet — call browser_navigate first."
+    fd, path = tempfile.mkstemp(suffix=".png", prefix="raven-screenshot-")
+    os.close(fd)
+    page.screenshot(path=path)
+    return path
+
+
 def _click(text: str) -> str:
     page = _ensure_page()
     el = _locate(page, text)
@@ -149,6 +168,13 @@ def read() -> str:
     """Return the current page's visible text (rendered, post-JavaScript —
     unlike fetch_url, this sees JS-built content). No confirmation needed."""
     return _run_in_browser_thread(_read)
+
+
+def screenshot() -> str:
+    """Save a PNG of the current page to a temp file and return its path
+    (V2). No confirmation needed — capturing an image isn't consequential;
+    follow up with analyze_image(path, question) to actually interpret it."""
+    return _run_in_browser_thread(_screenshot)
 
 
 def click(text: str) -> str:
