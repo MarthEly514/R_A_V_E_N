@@ -178,3 +178,70 @@ def test_a_pre_sessions_database_is_migrated_into_one_session(tmp_path):
     assert [x["title"] for x in s.list_sessions()] == [MIGRATED_TITLE]
     assert [m["content"] for m in s.load()] == ["old 1", "old 2"]
     assert len(Store(path).list_sessions()) == 1   # migrating twice must not duplicate anything
+
+
+# ---------------------------------------------------------------------------
+# Design mode's canvas: one row per shape, persisted per-session like messages.
+# ---------------------------------------------------------------------------
+
+def _el(element_id="el_1", **extra):
+    return {"id": element_id, "type": "polygon", "x": 0, "y": 0, "rotation": 0,
+            "fill": "#000", "stroke": "none", "stroke_width": 1, "z": 0,
+            "params": {"sides": 6, "radius": 80}, "points": [[0, 0]], **extra}
+
+
+def test_canvas_round_trip(store):
+    assert store.load_canvas() == []
+    store.save_canvas([_el()])
+    assert store.load_canvas() == [_el()]
+
+
+def test_canvas_save_replaces_the_whole_canvas_not_appends(store):
+    store.save_canvas([_el("el_1")])
+    store.save_canvas([_el("el_2")])
+    assert [el["id"] for el in store.load_canvas()] == ["el_2"]
+
+
+def test_canvas_save_with_an_empty_list_clears_it(store):
+    store.save_canvas([_el()])
+    store.save_canvas([])
+    assert store.load_canvas() == []
+
+
+def test_canvas_is_kept_separate_per_session(tmp_path):
+    from raven.store import Store
+    path = tmp_path / "h.db"
+    a = Store(path)
+    a.save_canvas([_el("el_a")])
+    other = a.create_session()
+    b = Store(path, session_id=other)
+    b.save_canvas([_el("el_b")])
+    assert [el["id"] for el in a.load_canvas()] == ["el_a"]
+    assert [el["id"] for el in b.load_canvas()] == ["el_b"]
+
+
+def test_delete_session_removes_its_canvas_too(tmp_path):
+    from raven.store import Store
+    path = tmp_path / "h.db"
+    a = Store(path)
+    other = a.create_session()
+    b = Store(path, session_id=other)
+    b.save_canvas([_el()])
+    a.delete_session(other)
+    assert Store(path, session_id=a.session_id).load_canvas() == []
+    import pytest
+    with pytest.raises(ValueError):
+        Store(path, session_id=other)
+
+
+def test_clear_removes_the_canvas_of_only_the_current_session(tmp_path):
+    from raven.store import Store
+    path = tmp_path / "h.db"
+    a = Store(path)
+    a.save_canvas([_el("el_a")])
+    other = a.create_session()
+    b = Store(path, session_id=other)
+    b.save_canvas([_el("el_b")])
+    a.clear()
+    assert a.load_canvas() == []
+    assert [el["id"] for el in b.load_canvas()] == ["el_b"]

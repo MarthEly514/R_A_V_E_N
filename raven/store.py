@@ -57,6 +57,14 @@ class Store:
             self.db.execute(
                 "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, message TEXT NOT NULL)"
             )
+            # Design mode's canvas (one row per shape). A brand new table, so
+            # unlike `messages` there's nothing from before this feature
+            # existed to migrate -- an old database just gets an empty table.
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS canvas_elements (id INTEGER PRIMARY KEY, "
+                "session_id INTEGER NOT NULL, element_id TEXT NOT NULL, element TEXT NOT NULL, "
+                "UNIQUE(session_id, element_id))"
+            )
             columns = [row[1] for row in self.db.execute("PRAGMA table_info(messages)")]
             if "session_id" not in columns:  # database from before sessions existed
                 self.db.execute("ALTER TABLE messages ADD COLUMN session_id INTEGER")
@@ -118,9 +126,36 @@ class Store:
         """Forget this session's messages (the session itself stays, retitled on next message)."""
         with self._lock:
             self.db.execute("DELETE FROM messages WHERE session_id = ?", (self.session_id,))
+            self.db.execute("DELETE FROM canvas_elements WHERE session_id = ?", (self.session_id,))
             self.db.execute(
                 "UPDATE sessions SET title = ? WHERE id = ?", (DEFAULT_TITLE, self.session_id)
             )
+            self.db.commit()
+
+    # -- this session's Design-mode canvas ---------------------------------------
+
+    def load_canvas(self) -> list[dict]:
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT element FROM canvas_elements WHERE session_id = ? ORDER BY id", (self.session_id,)
+            ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def save_canvas(self, elements: list[dict]) -> None:
+        """Replaces this session's whole canvas with `elements` -- delete then
+        bulk-insert in one transaction, the same "whole thing is small enough
+        to just rewrite" approach `clear()` already takes with messages.
+        Element order on disk is just an insertion-order tiebreak; real
+        stacking order is each element's own "z" field, same "storage order
+        != domain concept" split `messages`' own row order already has
+        relative to conversation semantics."""
+        with self._lock:
+            self.db.execute("DELETE FROM canvas_elements WHERE session_id = ?", (self.session_id,))
+            if elements:
+                self.db.executemany(
+                    "INSERT INTO canvas_elements (session_id, element_id, element) VALUES (?, ?, ?)",
+                    [(self.session_id, el["id"], json.dumps(el)) for el in elements],
+                )
             self.db.commit()
 
     # -- sessions (whole file) ---------------------------------------------------
@@ -160,6 +195,7 @@ class Store:
     def delete_session(self, session_id: int) -> None:
         with self._lock:
             self.db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            self.db.execute("DELETE FROM canvas_elements WHERE session_id = ?", (session_id,))
             self.db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self.db.commit()
 

@@ -12,6 +12,28 @@ export type ChatSession = { id: number; title: string; updated_at: number };
 export type PendingConfirm = { id: string; prompt: string };
 export type ToolEvent = { id: number; label: string };
 
+// Mirrors raven/design.py's element schema exactly -- geometry (points/d/
+// children) is always DERIVED server-side from params; the UI never
+// computes it itself, only sends param/position patches and renders
+// whatever the server hands back.
+export type CanvasElement = {
+  id: string;
+  type: 'polygon' | 'star' | 'path' | 'group';
+  generator?: string;
+  x: number;
+  y: number;
+  rotation: number;
+  scale: number;
+  fill: string;
+  stroke: string;
+  stroke_width: number;
+  z: number;
+  params: Record<string, unknown>;
+  points?: [number, number][];
+  d?: string;
+  children?: CanvasElement[];
+};
+
 type ServerMessage =
   | { type: 'history'; session: number; items: { role: 'user' | 'assistant'; text: string }[] }
   | { type: 'sessions'; current: number; items: ChatSession[] }
@@ -25,11 +47,17 @@ type ServerMessage =
   | { type: 'model_config'; provider: string; name: string }
   | { type: 'models'; provider: string; items: string[] }
   | { type: 'models_error'; provider: string; message: string }
+  | { type: 'user_config'; name: string; has_key: Record<string, boolean> }
   | { type: 'cancel_requested' }
-  | { type: 'cancelled' };
+  | { type: 'cancelled' }
+  | { type: 'canvas'; session: number; elements: CanvasElement[] }
+  | { type: 'canvas_update'; element: CanvasElement }
+  | { type: 'canvas_delete'; element_id: string };
 
 export type StatSegment = { name: string; text: string };
 export type ModelConfig = { provider: string; name: string };
+// has_key never carries the actual secret -- see server.py's _send_user_config.
+export type UserConfig = { name: string; has_key: Record<string, boolean> };
 
 
 const SERVER_URL = 'ws://127.0.0.1:8756/ws';
@@ -87,6 +115,8 @@ export function useRaven() {
   const [modelsByProvider, setModelsByProvider] = useState<Record<string, string[]>>({});
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsError, setModelsError] = useState<string | null>(null);
+  const [userConfig, setUserConfig] = useState<UserConfig | null>(null);
+  const [canvasElements, setCanvasElements] = useState<CanvasElement[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
   const toolId = useRef(0);
   // Pending push-to-talk transcriptions: id -> the promise's resolve/reject,
@@ -210,16 +240,52 @@ export function useRaven() {
             setModelsLoading(false);
             setModelsError(data.message);
             break;
+          case 'user_config':
+            setUserConfig({ name: data.name, has_key: data.has_key });
+            break;
           case 'confirm_request':
             setPendingConfirm({ id: data.id, prompt: data.prompt });
             break;
           case 'cancel_requested':
             setCancelling(true);
+            // The server auto-denies (and stops sending) any confirm_request
+            // for this turn from this point on -- drop whatever dialog is
+            // showing rather than leaving it stuck on screen with no reply
+            // ever coming for it.
+            setPendingConfirm(null);
             break;
           case 'cancelled':
             setBusy(false);
             setCancelling(false);
             setToolStatus(null);
+            // The server rolled this turn's user message + reply out of
+            // live history -- mirror that here, or the user's own prompt
+            // sits in the chat forever with no reply ever coming for it,
+            // looking stuck rather than genuinely discarded. Only one ask
+            // runs at a time, so the last message is always this turn's own.
+            setMessages((m) => (m.length && m[m.length - 1].role === 'user' ? m.slice(0, -1) : m));
+            break;
+          case 'canvas':
+            // The session's whole saved canvas -- replaces what's shown,
+            // same "connect/switch restores everything" moment as 'history'.
+            setCanvasElements(data.elements);
+            break;
+          case 'canvas_update': {
+            // One created/edited/grouped element -- upsert by id rather than
+            // replacing the whole array, so it can't clobber a DIFFERENT
+            // element's in-flight local drag state elsewhere in the UI.
+            const el = data.element;
+            setCanvasElements((prev) => {
+              const i = prev.findIndex((e) => e.id === el.id);
+              if (i === -1) return [...prev, el];
+              const next = prev.slice();
+              next[i] = el;
+              return next;
+            });
+            break;
+          }
+          case 'canvas_delete':
+            setCanvasElements((prev) => prev.filter((e) => e.id !== data.element_id));
             break;
           case 'error':
             setBusy(false);
@@ -332,11 +398,56 @@ export function useRaven() {
     [sendControl],
   );
 
+  // User name + API keys (SettingsPanel.tsx): lets a fresh install be fully
+  // configured without touching .env or settings.json by hand. setApiKey
+  // never reads the key back -- user_config only ever reports has_key booleans.
+  const getUserConfig = useCallback(() => sendControl({ type: 'get_user_config' }), [sendControl]);
+  const setApiKey = useCallback(
+    (provider: string, key: string) => sendControl({ type: 'set_api_key', provider, key }),
+    [sendControl],
+  );
+  const setUserName = useCallback(
+    (name: string) => sendControl({ type: 'set_user_name', name }),
+    [sendControl],
+  );
+
+  // Design mode (DesignStage.tsx): the canvas itself lives here (canvasElements,
+  // pushed/patched by the 'canvas'/'canvas_update'/'canvas_delete' cases
+  // above); selection, pan/zoom, and undo history are ephemeral UI-only state
+  // that stays local to DesignStage, same reasoning ChatStage keeps its own
+  // edit-draft state instead of putting it in this hook.
+  const getCanvas = useCallback(() => sendControl({ type: 'get_canvas' }), [sendControl]);
+  const editCanvasElement = useCallback(
+    (elementId: string, patch: Record<string, unknown>) =>
+      sendControl({ type: 'canvas_edit', element_id: elementId, patch }),
+    [sendControl],
+  );
+  const deleteCanvasElement = useCallback(
+    (elementId: string) => sendControl({ type: 'canvas_delete', element_id: elementId }),
+    [sendControl],
+  );
+  const groupCanvasElements = useCallback(
+    (elementIds: string[]) => sendControl({ type: 'canvas_group', element_ids: elementIds }),
+    [sendControl],
+  );
+  const ungroupCanvasElement = useCallback(
+    (groupId: string) => sendControl({ type: 'canvas_ungroup', group_id: groupId }),
+    [sendControl],
+  );
+  // Undo's own restore-a-deletion step: the client already holds the exact
+  // element it asked to delete, so it just hands it straight back.
+  const restoreCanvasElement = useCallback(
+    (element: CanvasElement) => sendControl({ type: 'canvas_restore', element }),
+    [sendControl],
+  );
+
   return {
     connected, messages, busy, cancelling, statusText, toolLog, pendingConfirm, error, sessions, currentSession, stats,
-    modelConfig, modelsByProvider, modelsLoading, modelsError,
+    modelConfig, modelsByProvider, modelsLoading, modelsError, userConfig, canvasElements,
     ask, cancelAsk, respondToConfirm, dismissError, newSession, openSession, deleteSession, requestTranscribe,
-    getModelConfig, listModels, setModel,
+    getModelConfig, listModels, setModel, getUserConfig, setApiKey, setUserName,
+    getCanvas, editCanvasElement, deleteCanvasElement, groupCanvasElements, ungroupCanvasElement,
+    restoreCanvasElement,
   };
 }
 
@@ -357,6 +468,28 @@ function toolStatusText(name: string, args: Record<string, unknown>): string {
       return `Running ${args.command ?? 'a command'}`;
     case 'load_skill':
       return `Loading skill ${args.name ?? ''}`;
+    case 'draw_polygon':
+      return `Drawing a ${args.sides ?? 6}-sided polygon`;
+    case 'draw_star':
+      return `Drawing a ${args.points ?? 5}-pointed star`;
+    case 'draw_golden_rectangle':
+      return 'Drawing a golden rectangle';
+    case 'draw_golden_spiral':
+      return 'Drawing a golden spiral';
+    case 'draw_radial_pattern':
+      return `Drawing a radial pattern (${args.motif ?? 'a shape'})`;
+    case 'draw_grid':
+      return 'Drawing a grid';
+    case 'draw_bezier':
+      return 'Drawing a Bezier curve';
+    case 'draw_lissajous':
+      return 'Drawing a Lissajous curve';
+    case 'list_canvas_elements':
+      return 'Looking at the canvas';
+    case 'update_canvas_element':
+      return `Updating shape ${args.element_id ?? ''}`;
+    case 'delete_canvas_element':
+      return `Deleting shape ${args.element_id ?? ''}`;
     default:
       return name.replace(/_/g, ' ');
   }

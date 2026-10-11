@@ -16,12 +16,17 @@ python -m venv venv
 source venv/bin/activate            # Windows: venv\Scripts\activate
 pip install .                       # installs the `raven` and `raven-server` commands
 pip install ".[voice]"              # optional: push-to-talk voice input
-export OPENROUTER_API_KEY=your-key-here     # Windows (PowerShell): $env:OPENROUTER_API_KEY="your-key"
 raven                               # or: python -m raven.cli
 ```
 
-(Or put `OPENROUTER_API_KEY=...` in a `.env` file. Developers: `pip install -e ".[dev]"`
-gives an editable install plus the test tools. `pip install -r requirements.txt` still works too.)
+No `.env` file or environment variable needed -- the first time you run `raven`,
+it asks for your name and, if no key is configured yet, your provider and API
+key, then saves them to `~/.raven/settings.json`. Change either later with
+`/name` or `/apikey [provider]` (and `/provider [name]` to switch providers).
+An `OPENROUTER_API_KEY`/`NVIDIA_API_KEY`/`FREELLMAPI_API_KEY` env var or `.env`
+entry still works too, and is used as a fallback when nothing is saved in
+settings.json. (Developers: `pip install -e ".[dev]"` gives an editable
+install plus the test tools. `pip install -r requirements.txt` still works too.)
 
 ## Model provider
 
@@ -35,13 +40,10 @@ Two providers work today:
 | Fallback models | one request, OpenRouter tries each in order | tried client-side, one HTTP call per candidate |
 | Picking a model | type an id into `settings.json` | listable from a key (desktop app) or typed manually |
 
-Switch providers by editing `~/.raven/settings.json`:
-
-```json
-{"model": {"provider": "nvidia", "name": "meta/llama-3.1-8b-instruct", "fallbacks": []}}
-```
-
-or from the desktop app: Settings → Model → pick a provider. Picking NVIDIA
+Switch providers with `/provider nvidia` (CLI) or the desktop app's Settings
+→ Model picker -- both also take care of the API key (`/apikey` in the CLI,
+the key field under Settings → Model in the desktop app), so neither needs
+`~/.raven/settings.json` hand-edited. Picking NVIDIA in the desktop app
 loads the models your key can access straight from NVIDIA's API (`list_models`
 in `raven/server.py`) into a dropdown; OpenRouter still takes a typed model
 id, since there's no listing endpoint wired up for it yet. Whichever you set
@@ -127,6 +129,26 @@ releasing Shift before the microphone finishes opening (a very fast tap) is
 handled cleanly rather than getting stuck. Electron grants microphone
 access to the app automatically (`main.ts`'s permission handler) -- only
 this window can ask.
+
+### Design mode: a mathematical drawing playground
+
+The desktop app's "Designer" mode (left rail) is a Figma-like canvas where
+R.A.V.E.N draws shapes using mathematical generators -- golden rectangles and
+spirals, regular/star polygons, radial (mandala-style) patterns, grid
+layouts, and Bezier/Lissajous curves -- and you can then directly move,
+resize, rotate, recolor, reparametrize, reorder, group/ungroup, and delete
+what she drew, with pan/zoom and undo/redo (Ctrl+Z / Ctrl+Shift+Z). Ask for
+something the same way you'd chat: "draw a hexagon," "make it red," "turn
+that into a mandala with 8 copies."
+
+Every shape's actual geometry is generated server-side from its own
+mathematical parameters (e.g. a hexagon's `sides`/`radius`) -- editing a
+shape's numbers in the Properties panel regenerates it exactly, rather than
+just stretching a picture of it. Your own edits are also remembered: R.A.V.E.N
+gets a short note about what you changed by hand before her next reply, so
+"make it bigger" after you've dragged a shape somewhere new still means the
+right shape. The canvas is saved per chat session, exactly like the
+conversation itself -- switching chats switches canvases too.
 
 ## Headless mode
 

@@ -11,7 +11,7 @@ from unittest.mock import patch
 import pytest
 
 import raven.assistant as assistant_module
-from raven.assistant import Assistant, strip_emoji
+from raven.assistant import Assistant, strip_emoji, _coerce_numeric_strings, _ensure_visible
 from raven import gmail as gmail_impl
 from raven import platforms
 from raven import tools as tool_impl
@@ -1071,6 +1071,24 @@ def test_analyze_image_reads_the_real_file_and_calls_the_vision_model(tmp_path):
     assert base64.b64decode(image_b64) == image.read_bytes()
 
 
+def test_analyze_image_resolves_the_vision_model_for_the_active_provider(tmp_path):
+    """The exact bug this is a regression test for: a per-provider vision
+    dict must resolve against model.provider, not be passed through
+    unresolved (which would send the whole dict as the 'model' field and
+    404/500 against the real API) and not silently reuse a DIFFERENT
+    provider's model slug. See config.get_vision_model + DEV_LOG Step 3.79."""
+    image = tmp_path / "photo.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nfake png bytes")
+    provider = VisionProvider("red")
+    a = Assistant(provider, settings={
+        "model": {"provider": "nvidia", "vision": {"openrouter": "or-model", "nvidia": "nv-model"}},
+    })
+    assert a.vision_model == "nv-model"
+    a._analyze_image(str(image), "what color?")
+    _, _, _, model = provider.calls[0]
+    assert model == "nv-model"
+
+
 def test_analyze_image_propagates_a_failed_api_call_as_an_error_string():
     class FailingProvider:
         def reply_with_image(self, question, image_b64, mime_type, model):
@@ -1120,3 +1138,381 @@ def test_analyze_image_defaults_the_question_when_omitted():
     finally:
         os.remove(path)
     assert provider.calls[0][0] == "Describe this image."
+
+
+# ---------------------------------------------------------------------------
+# Design mode: mathematically-generated shapes on the session's canvas.
+# Every draw_*/list/update/delete_canvas_element name is intercepted in
+# _run_tool BEFORE _confirm_prompt is ever reached (same shape as
+# load_skill/analyze_image) -- so unlike NO_CONFIRM_PROBES above, the
+# meaningful check here is that _run_tool never calls confirm_run for these,
+# not just that _confirm_prompt(name, ...) happens to return None.
+# ---------------------------------------------------------------------------
+
+DESIGN_TOOL_NAMES = tool_impl.SKILLS["design"]
+
+
+@pytest.mark.parametrize("name", DESIGN_TOOL_NAMES)
+def test_design_tools_are_in_the_design_skill_and_have_specs(name):
+    spec_names = {s["function"]["name"] for s in tool_impl.TOOL_SPECS}
+    assert name in spec_names
+
+
+def test_draw_polygon_never_asks_for_confirmation():
+    confirms = []
+    a = Assistant(provider=None, confirm_run=lambda p: confirms.append(p) or True)
+    result = a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 80}))
+    assert confirms == []
+    assert "Drew" in result
+    assert len(a.canvas) == 1
+    assert a.canvas[0]["type"] == "polygon"
+    assert a.canvas[0]["generator"] == "regular_polygon"
+    assert len(a.canvas[0]["points"]) == 6
+
+
+def test_coerce_numeric_strings_converts_ints_and_floats_recursively():
+    assert _coerce_numeric_strings({
+        "sides": "6", "amount": "1.5", "fill": "none", "motif": "regular_polygon",
+        "nested": {"a": "3"}, "points": [["1", "2.5"], ["3", "4"]],
+    }) == {
+        "sides": 6, "amount": 1.5, "fill": "none", "motif": "regular_polygon",
+        "nested": {"a": 3}, "points": [[1, 2.5], [3, 4]],
+    }
+
+
+def test_coerce_numeric_strings_leaves_already_numeric_and_non_numeric_values_alone():
+    assert _coerce_numeric_strings({"sides": 6, "fill": "#ff0000", "flag": True}) == {
+        "sides": 6, "fill": "#ff0000", "flag": True,
+    }
+
+
+def test_draw_polygon_works_even_when_the_model_sends_numeric_args_as_strings():
+    """Real bug, found live against a real NVIDIA-hosted model: it sent
+    {"sides": "6", "radius": "80", "x": "0", ...} -- JSON strings, not
+    numbers -- for a tool spec that declares them "integer"/"number". The
+    spec is only a hint to the model, never enforced on the wire, and this
+    model (not a fabricated edge case) ignored it on every single call,
+    crashing draw_polygon 100% of the time with "can't multiply sequence by
+    non-int of type 'float'" before this fix -- nothing ever appeared on
+    the canvas, exactly matching the user's report."""
+    a = Assistant(provider=None)
+    result = a._run_tool(_call("draw_polygon", {
+        "sides": "6", "radius": "80", "x": "0", "y": "0", "rotation": "0",
+        "fill": "none", "stroke": "none", "stroke_width": "1",
+    }))
+    assert "Drew" in result
+    assert not result.startswith("Error")
+    assert len(a.canvas) == 1
+    el = a.canvas[0]
+    assert el["params"] == {"sides": 6, "radius": 80}
+    assert el["x"] == 0 and el["y"] == 0 and el["rotation"] == 0
+    assert len(el["points"]) == 6
+
+
+def test_draw_radial_pattern_coerces_numeric_strings_in_nested_motif_params():
+    a = Assistant(provider=None)
+    result = a._run_tool(_call("draw_radial_pattern", {
+        "motif": "regular_polygon", "motif_params": {"sides": "6", "radius": "20"},
+        "repetitions": "6", "orbit_radius": "100",
+    }))
+    assert "Drew" in result
+    el = a.canvas[0]
+    assert el["params"]["repetitions"] == 6
+    assert el["params"]["motif_params"] == {"sides": 6, "radius": 20}
+
+
+def test_update_canvas_element_coerces_numeric_strings_in_the_patch():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 80}))
+    element_id = a.canvas[0]["id"]
+    result = a._run_tool(_call("update_canvas_element", {
+        "element_id": element_id, "patch": {"x": "150", "params": {"sides": "8"}},
+    }))
+    assert "Updated" in result
+    assert a.canvas[0]["x"] == 150
+    assert a.canvas[0]["params"]["sides"] == 8
+    assert len(a.canvas[0]["points"]) == 8
+
+
+def test_apply_canvas_edit_coerces_numeric_strings_from_the_ui_too():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 80}))
+    element_id = a.canvas[0]["id"]
+    el = a.apply_canvas_edit(element_id, {"x": "42", "rotation": "90"})
+    assert el["x"] == 42 and el["rotation"] == 90
+
+
+def test_ensure_visible_adds_a_fallback_stroke_when_both_fill_and_stroke_are_none():
+    el = {"fill": "none", "stroke": "none"}
+    _ensure_visible(el)
+    assert el["stroke"] != "none"
+    assert el["stroke_width"]
+
+
+def test_ensure_visible_leaves_a_shape_with_a_real_fill_or_stroke_alone():
+    el = {"fill": "#ff0000", "stroke": "none"}
+    _ensure_visible(el)
+    assert el["stroke"] == "none"  # untouched -- fill alone already makes it visible
+
+    el2 = {"fill": "none", "stroke": "#00ff00"}
+    _ensure_visible(el2)
+    assert el2["stroke"] == "#00ff00"
+
+
+def test_draw_polygon_is_never_invisible_even_when_the_model_asks_for_no_fill_and_no_stroke():
+    """Real bug, found live against a real model: it drew a circle-like
+    polygon with fill="none" AND stroke="none" (its own default) -- the
+    tool call succeeded and said "Drew ...", but nothing was actually
+    visible, which looks exactly like the original 'nothing draws' report."""
+    a = Assistant(provider=None)
+    result = a._run_tool(_call("draw_polygon", {
+        "sides": 100, "radius": 50, "fill": "none", "stroke": "none",
+    }))
+    assert "Drew" in result
+    el = a.canvas[0]
+    assert not (el["fill"] in ("none", "") and el["stroke"] in ("none", ""))
+
+
+def test_update_canvas_element_also_guards_against_becoming_invisible():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 80, "fill": "#ff0000"}))
+    element_id = a.canvas[0]["id"]
+    a._run_tool(_call("update_canvas_element", {
+        "element_id": element_id, "patch": {"fill": "none"},
+    }))
+    el = a.canvas[0]
+    assert not (el["fill"] in ("none", "") and el["stroke"] in ("none", ""))
+
+
+def test_update_canvas_element_does_not_touch_visibility_when_unrelated_fields_change():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 80, "fill": "none", "stroke": "none"}))
+    element_id = a.canvas[0]["id"]
+    # This shape is already "fixed up" to be visible by the guard above --
+    # moving it shouldn't re-trigger or otherwise disturb its stroke.
+    stroke_before = a.canvas[0]["stroke"]
+    a._run_tool(_call("update_canvas_element", {"element_id": element_id, "patch": {"x": 10}}))
+    assert a.canvas[0]["stroke"] == stroke_before
+
+
+def test_draw_tools_place_the_shape_at_the_given_position():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_star", {"points": 5, "outer_radius": 100, "inner_radius": 40,
+                                     "x": 50, "y": -30, "fill": "#ff0000"}))
+    el = a.canvas[0]
+    assert el["x"] == 50 and el["y"] == -30 and el["fill"] == "#ff0000"
+
+
+def test_draw_tools_assign_increasing_z_order():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_polygon", {"sides": 3, "radius": 10}))
+    a._run_tool(_call("draw_polygon", {"sides": 4, "radius": 10}))
+    assert [el["z"] for el in a.canvas] == [0, 1]
+
+
+def test_draw_tool_calls_on_canvas_update_with_the_new_element():
+    seen = []
+    a = Assistant(provider=None, on_canvas_update=lambda el: seen.append(el))
+    a._run_tool(_call("draw_golden_rectangle", {"width": 100}))
+    assert len(seen) == 1
+    assert seen[0]["id"] == a.canvas[0]["id"]
+
+
+def test_draw_radial_pattern_builds_a_group_from_a_named_motif():
+    a = Assistant(provider=None)
+    result = a._run_tool(_call("draw_radial_pattern", {
+        "motif": "regular_polygon", "motif_params": {"sides": 6, "radius": 20},
+        "repetitions": 6, "orbit_radius": 100,
+    }))
+    assert "Drew" in result
+    el = a.canvas[0]
+    assert el["type"] == "group" and el["generator"] == "radial_pattern"
+    assert len(el["children"]) == 6
+
+
+def test_draw_radial_pattern_rejects_an_unknown_motif():
+    a = Assistant(provider=None)
+    result = a._run_tool(_call("draw_radial_pattern", {"motif": "not_a_thing", "motif_params": {}}))
+    assert result.startswith("Error:")
+    assert a.canvas == []
+
+
+def test_list_canvas_elements_reports_an_empty_canvas():
+    a = Assistant(provider=None)
+    assert a._run_tool(_call("list_canvas_elements", {})) == "The canvas is empty."
+
+
+def test_list_canvas_elements_describes_what_was_drawn():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 80}))
+    listing = a._run_tool(_call("list_canvas_elements", {}))
+    assert a.canvas[0]["id"] in listing
+    assert "regular_polygon" in listing
+
+
+def test_update_canvas_element_regenerates_geometry_from_new_params():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 80}))
+    element_id = a.canvas[0]["id"]
+    result = a._run_tool(_call("update_canvas_element", {
+        "element_id": element_id, "patch": {"params": {"sides": 8}},
+    }))
+    assert "Updated" in result
+    assert len(a.canvas[0]["points"]) == 8
+    assert a.canvas[0]["params"]["sides"] == 8
+
+
+def test_update_canvas_element_can_change_position_and_color_without_params():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 80}))
+    element_id = a.canvas[0]["id"]
+    a._run_tool(_call("update_canvas_element", {
+        "element_id": element_id, "patch": {"x": 200, "fill": "#00ff00"},
+    }))
+    assert a.canvas[0]["x"] == 200 and a.canvas[0]["fill"] == "#00ff00"
+
+
+def test_update_canvas_element_unknown_id_is_a_clear_error():
+    a = Assistant(provider=None)
+    result = a._run_tool(_call("update_canvas_element", {"element_id": "nope", "patch": {"x": 1}}))
+    assert result.startswith("Error:")
+
+
+def test_delete_canvas_element_removes_it_and_notifies():
+    deleted_ids = []
+    a = Assistant(provider=None, on_canvas_delete=lambda eid: deleted_ids.append(eid))
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 80}))
+    element_id = a.canvas[0]["id"]
+    result = a._run_tool(_call("delete_canvas_element", {"element_id": element_id}))
+    assert "Deleted" in result
+    assert a.canvas == []
+    assert deleted_ids == [element_id]
+
+
+def test_delete_canvas_element_unknown_id_is_a_clear_error():
+    a = Assistant(provider=None)
+    result = a._run_tool(_call("delete_canvas_element", {"element_id": "nope"}))
+    assert result.startswith("Error:")
+
+
+def test_canvas_persists_and_reloads_via_the_store(tmp_path):
+    from raven.store import Store
+    store = Store(tmp_path / "h.db")
+    a = Assistant(provider=None, store=store)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 80}))
+    reloaded = Assistant(provider=None, store=Store(tmp_path / "h.db", session_id=store.session_id))
+    assert len(reloaded.canvas) == 1
+    assert reloaded.canvas[0]["params"]["sides"] == 6
+
+
+# -- user hand-edits: apply_canvas_edit / delete_canvas_element_by_user / grouping ---
+
+def test_apply_canvas_edit_updates_the_element_and_records_a_pending_change():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 80}))
+    element_id = a.canvas[0]["id"]
+    el = a.apply_canvas_edit(element_id, {"x": 42})
+    assert el["x"] == 42
+    assert a._pending_canvas_changes  # something was recorded
+
+
+def test_apply_canvas_edit_unknown_id_returns_none_and_records_nothing():
+    a = Assistant(provider=None)
+    assert a.apply_canvas_edit("nope", {"x": 1}) is None
+    assert a._pending_canvas_changes == []
+
+
+def test_canvas_delta_summary_is_injected_once_then_cleared():
+    """The user's hand-edit shows up as a one-off context message on
+    R.A.V.E.N's NEXT turn, then doesn't repeat on the turn after that."""
+    provider = ScriptedProvider([
+        {"role": "assistant", "content": "ok"},
+        {"role": "assistant", "content": "ok again"},
+    ])
+    a = Assistant(provider)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 80}))
+    a.apply_canvas_edit(a.canvas[0]["id"], {"x": 99})
+    a.ask("what's on the canvas?")
+    first_context = provider.calls[0]
+    assert any("Canvas changed" in (m.get("content") or "") for m in first_context)
+    a.ask("anything else?")
+    second_context = provider.calls[-1]
+    assert not any("Canvas changed" in (m.get("content") or "") for m in second_context)
+
+
+def test_delete_canvas_element_by_user_records_a_pending_change():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 80}))
+    element_id = a.canvas[0]["id"]
+    assert a.delete_canvas_element_by_user(element_id) is True
+    assert a.canvas == []
+    assert any("deleted" in c.lower() for c in a._pending_canvas_changes)
+
+
+def test_delete_canvas_element_by_user_unknown_id_returns_false():
+    a = Assistant(provider=None)
+    assert a.delete_canvas_element_by_user("nope") is False
+
+
+def test_group_elements_positions_children_relative_to_the_centroid():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 10, "x": 0, "y": 0}))
+    a._run_tool(_call("draw_star", {"points": 5, "outer_radius": 10, "inner_radius": 4, "x": 100, "y": 0}))
+    ids = [el["id"] for el in a.canvas]
+    group = a.group_elements(ids)
+    assert group is not None and group["type"] == "group"
+    assert group["x"] == 50 and group["y"] == 0
+    assert len(a.canvas) == 1  # the two originals were absorbed into the group
+    xs = sorted(child["x"] for child in group["children"])
+    assert xs == [-50, 50]
+
+
+def test_group_elements_needs_at_least_two_elements():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 10}))
+    assert a.group_elements([a.canvas[0]["id"]]) is None
+
+
+def test_ungroup_elements_restores_original_absolute_positions():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 10, "x": 0, "y": 0}))
+    a._run_tool(_call("draw_star", {"points": 5, "outer_radius": 10, "inner_radius": 4, "x": 100, "y": 0}))
+    ids = [el["id"] for el in a.canvas]
+    group = a.group_elements(ids)
+    restored = a.ungroup_elements(group["id"])
+    assert {el["id"] for el in restored} == set(ids)
+    xs = sorted(el["x"] for el in restored)
+    assert xs == pytest.approx([0, 100])
+    assert all(el["id"] != group["id"] for el in a.canvas)
+
+
+def test_ungroup_elements_after_moving_the_group_offsets_children_correctly():
+    a = Assistant(provider=None)
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 10, "x": 0, "y": 0}))
+    a._run_tool(_call("draw_star", {"points": 5, "outer_radius": 10, "inner_radius": 4, "x": 100, "y": 0}))
+    ids = [el["id"] for el in a.canvas]
+    group = a.group_elements(ids)
+    a.apply_canvas_edit(group["id"], {"x": group["x"] + 20, "y": group["y"] + 5})
+    restored = a.ungroup_elements(group["id"])
+    xs = sorted(el["x"] for el in restored)
+    assert xs == pytest.approx([20, 120])
+    assert all(el["y"] == pytest.approx(5) for el in restored)
+
+
+def test_ungroup_elements_unknown_id_returns_none():
+    a = Assistant(provider=None)
+    assert a.ungroup_elements("nope") is None
+
+
+def test_restore_element_puts_it_back_with_the_same_id():
+    seen = []
+    a = Assistant(provider=None, on_canvas_update=lambda el: seen.append(el))
+    a._run_tool(_call("draw_polygon", {"sides": 6, "radius": 80}))
+    element_id = a.canvas[0]["id"]
+    deleted = a.canvas[0]
+    a.delete_canvas_element_by_user(element_id)
+    assert a.canvas == []
+    restored = a.restore_element(deleted)
+    assert restored["id"] == element_id
+    assert a.canvas == [deleted]
+    assert seen[-1]["id"] == element_id

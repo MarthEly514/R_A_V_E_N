@@ -8,7 +8,7 @@ server itself) -- only the Assistant's own dependencies are faked.
 """
 import json
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -37,6 +37,7 @@ def _configure(MockStore, history=None):
     """A mocked Store that behaves like an empty single-session store."""
     m = MockStore.return_value
     m.load.return_value = history or []
+    m.load_canvas.return_value = []
     m.session_id = 1
     m.list_sessions.return_value = []
     m.message_count.return_value = 0
@@ -525,7 +526,7 @@ def test_list_models_returns_the_nvidia_catalog():
         with TestClient(server.app).websocket_connect("/ws") as ws:
             ws.send_json({"type": "list_models", "provider": "nvidia"})
             msg = _recv(ws, "models")
-    mock_get_key.assert_any_call("nvidia")
+    mock_get_key.assert_any_call("nvidia", ANY)
     mock_list.assert_called_once_with("fake-key")
     assert msg == {"type": "models", "provider": "nvidia", "items": ["meta/llama-3.1-8b-instruct", "google/gemma-2-9b"]}
 
@@ -568,7 +569,7 @@ def test_set_model_switches_provider_persists_and_takes_effect_immediately():
             ws.send_json({"type": "set_model", "provider": "nvidia", "name": "meta/llama-3.1-8b-instruct"})
             config_msg = _recv(ws, "model_config")
 
-    mock_get_key.assert_any_call("nvidia")
+    mock_get_key.assert_any_call("nvidia", ANY)
     # switching PROVIDER (openrouter -> nvidia) must drop the old provider's fallbacks
     MockNvidia.assert_called_once_with(api_key="nv-key", model="meta/llama-3.1-8b-instruct", fallbacks=[])
     saved = mock_save.call_args[0][0]
@@ -629,7 +630,7 @@ def test_set_model_a_bad_api_key_leaves_the_current_model_untouched():
     strand the session on a broken model or corrupt settings.json."""
     settings = _default_model_settings()
 
-    def flaky_get_key(provider):
+    def flaky_get_key(provider, settings=None):
         if provider == "nvidia":
             raise RuntimeError("Set NVIDIA_API_KEY in your environment or .env file")
         return "fake-key"
@@ -645,6 +646,114 @@ def test_set_model_a_bad_api_key_leaves_the_current_model_untouched():
             msg = _recv(ws, "error")
     assert "NVIDIA_API_KEY" in msg["message"]
     mock_save.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# user_config / set_api_key / set_user_name (desktop Settings panel release
+# goal): a fresh install configured entirely from the UI -- no .env file,
+# no hand-edited settings.json. The key itself is never echoed back.
+# ---------------------------------------------------------------------------
+
+def _default_user_settings():
+    return {
+        "model": {"provider": "openrouter", "name": "openrouter/free", "fallbacks": []},
+        "api_keys": {"openrouter": "", "nvidia": "", "freellmapi": ""},
+        "user": {"name": ""},
+        "statusline": {"segments": ["memory"]},
+    }
+
+
+def test_get_user_config_reports_name_and_which_providers_have_a_key():
+    settings = _default_user_settings()
+    settings["user"]["name"] = "Ely"
+    settings["api_keys"]["nvidia"] = "nv-key"
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "load_settings", return_value=settings):
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "get_user_config"})
+            msg = _recv(ws, "user_config")
+    assert msg == {
+        "type": "user_config", "name": "Ely",
+        "has_key": {"openrouter": False, "nvidia": True, "freellmapi": False},
+    }
+
+
+def test_set_api_key_persists_and_never_echoes_the_key_back():
+    settings = _default_user_settings()
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider") as MockOpenRouter, \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "load_settings", return_value=settings), \
+         patch.object(server, "save_settings") as mock_save:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "set_api_key", "provider": "openrouter", "key": "sk-secret"})
+            msg = _recv(ws, "user_config")
+    saved = mock_save.call_args[0][0]
+    assert saved["api_keys"]["openrouter"] == "sk-secret"
+    assert "sk-secret" not in json.dumps(msg)
+    # it's the active provider -- takes effect immediately, same as set_model
+    MockOpenRouter.assert_called_with(api_key="sk-secret", model="openrouter/free", fallbacks=[])
+
+
+def test_set_api_key_for_a_different_provider_persists_without_rebuilding_the_live_provider():
+    settings = _default_user_settings()  # active provider is openrouter
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider") as MockOpenRouter, \
+         patch.object(server, "NvidiaProvider") as MockNvidia, \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "load_settings", return_value=settings), \
+         patch.object(server, "save_settings") as mock_save:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "set_api_key", "provider": "nvidia", "key": "nv-secret"})
+            _recv(ws, "user_config")
+    assert mock_save.call_args[0][0]["api_keys"]["nvidia"] == "nv-secret"
+    MockNvidia.assert_not_called()
+
+
+def test_set_api_key_rejects_an_unknown_provider():
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "save_settings") as mock_save:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "set_api_key", "provider": "openai", "key": "x"})
+            msg = _recv(ws, "error")
+    assert "Unknown model provider" in msg["message"]
+    mock_save.assert_not_called()
+
+
+def test_set_api_key_rejects_an_empty_key():
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "save_settings") as mock_save:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "set_api_key", "provider": "openrouter", "key": "   "})
+            msg = _recv(ws, "error")
+    assert "API key is required" in msg["message"]
+    mock_save.assert_not_called()
+
+
+def test_set_user_name_persists_and_is_reported_back():
+    settings = _default_user_settings()
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "load_settings", return_value=settings), \
+         patch.object(server, "save_settings") as mock_save:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "set_user_name", "name": "Ely"})
+            msg = _recv(ws, "user_config")
+    assert mock_save.call_args[0][0]["user"]["name"] == "Ely"
+    assert msg["name"] == "Ely"
 
 
 # ---------------------------------------------------------------------------
@@ -785,3 +894,283 @@ def test_cancelling_a_call_that_then_fails_reports_cancelled_not_an_error(real_s
         release.set()
         settled = _recv(ws, "cancelled")
     assert settled == {"type": "cancelled"}
+
+
+# ---------------------------------------------------------------------------
+# Design mode: the canvas protocol. Uses the same real_store fixture as
+# sessions above -- the behavior under test is the interaction between
+# server, Assistant's canvas, and the real SQLite store.
+# ---------------------------------------------------------------------------
+
+def _draw_via_tool_call(MockProvider, ws, name="draw_polygon", args=None):
+    """Scripts the mocked provider to emit one tool call then a final reply,
+    drives one ask() through it, and returns the pushed canvas_update
+    element. Mirrors _ask()'s draining discipline for the extra messages a
+    tool-calling turn produces (tool_call, canvas_update, reply, sessions,
+    stats)."""
+    args = args or {"sides": 6, "radius": 80}
+    MockProvider.return_value.reply.side_effect = [
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "c1", "function": {"name": name, "arguments": json.dumps(args)}}]},
+        {"role": "assistant", "content": "done"},
+    ]
+    ws.send_json({"type": "ask", "text": "draw something"})
+    update = _recv(ws, "canvas_update")
+    _recv(ws, "reply")
+    _recv(ws, "sessions")
+    _recv(ws, "stats")
+    return update["element"]
+
+
+def test_canvas_is_sent_alongside_history_on_connect():
+    with patch.object(server, "get_api_key", return_value="fake-key"), \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "get_history"})
+            _recv(ws, "history")
+            canvas = _recv(ws, "canvas")
+    assert canvas == {"type": "canvas", "session": 1, "elements": []}
+
+
+def test_get_canvas_message_returns_the_current_canvas(real_store):
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        ws.send_json({"type": "get_canvas"})
+        canvas = _recv(ws, "canvas")
+    assert canvas["elements"] == []
+
+
+def test_a_draw_tool_call_pushes_a_canvas_update(real_store):
+    store, MockProvider = real_store
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        element = _draw_via_tool_call(MockProvider, ws)
+    assert element["type"] == "polygon"
+    assert element["params"]["sides"] == 6
+
+
+def test_a_drawn_shape_persists_and_reloads_on_reconnect(real_store):
+    store, MockProvider = real_store
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        element = _draw_via_tool_call(MockProvider, ws)
+    with TestClient(server.app).websocket_connect("/ws") as ws2:
+        ws2.send_json({"type": "get_history"})
+        _recv(ws2, "history")
+        canvas = _recv(ws2, "canvas")
+    assert [el["id"] for el in canvas["elements"]] == [element["id"]]
+
+
+def test_canvas_edit_updates_the_element_and_pushes_the_result(real_store):
+    store, MockProvider = real_store
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        element = _draw_via_tool_call(MockProvider, ws)
+        ws.send_json({"type": "canvas_edit", "element_id": element["id"], "patch": {"x": 250}})
+        update = _recv(ws, "canvas_update")
+    assert update["element"]["x"] == 250
+    assert update["element"]["id"] == element["id"]
+
+
+def test_canvas_edit_on_an_unknown_id_reports_a_clear_error(real_store):
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        ws.send_json({"type": "canvas_edit", "element_id": "nope", "patch": {"x": 1}})
+        error = _recv(ws, "error")
+    assert "No such canvas element" in error["message"]
+
+
+def test_canvas_delete_message_removes_the_element(real_store):
+    store, MockProvider = real_store
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        element = _draw_via_tool_call(MockProvider, ws)
+        ws.send_json({"type": "canvas_delete", "element_id": element["id"]})
+        deleted = _recv(ws, "canvas_delete")
+    assert deleted["element_id"] == element["id"]
+
+
+def test_canvas_delete_on_an_unknown_id_reports_a_clear_error(real_store):
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        ws.send_json({"type": "canvas_delete", "element_id": "nope"})
+        error = _recv(ws, "error")
+    assert "No such canvas element" in error["message"]
+
+
+def test_canvas_group_and_ungroup_round_trip(real_store):
+    store, MockProvider = real_store
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        first = _draw_via_tool_call(MockProvider, ws, args={"sides": 3, "radius": 10})
+        second = _draw_via_tool_call(MockProvider, ws, name="draw_star",
+                                      args={"points": 5, "outer_radius": 10, "inner_radius": 4})
+        ws.send_json({"type": "canvas_group", "element_ids": [first["id"], second["id"]]})
+        grouped = _recv(ws, "canvas_update")
+        assert grouped["element"]["type"] == "group"
+        group_id = grouped["element"]["id"]
+
+        ws.send_json({"type": "canvas_ungroup", "group_id": group_id})
+        deleted = _recv(ws, "canvas_delete")
+        assert deleted["element_id"] == group_id
+
+
+def test_canvas_group_with_fewer_than_two_elements_reports_a_clear_error(real_store):
+    store, MockProvider = real_store
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        element = _draw_via_tool_call(MockProvider, ws)
+        ws.send_json({"type": "canvas_group", "element_ids": [element["id"]]})
+        error = _recv(ws, "error")
+    assert "at least 2" in error["message"]
+
+
+def test_canvas_ungroup_on_an_unknown_id_reports_a_clear_error(real_store):
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        ws.send_json({"type": "canvas_ungroup", "group_id": "nope"})
+        error = _recv(ws, "error")
+    assert "No such group" in error["message"]
+
+
+def test_switching_sessions_switches_the_canvas_too(real_store):
+    store, MockProvider = real_store
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        first_element = _draw_via_tool_call(MockProvider, ws)
+        ws.send_json({"type": "new_session"})
+        _recv(ws, "history")
+        empty_canvas = _recv(ws, "canvas")
+        _recv(ws, "sessions")
+        assert empty_canvas["elements"] == []
+        second_element = _draw_via_tool_call(MockProvider, ws, args={"sides": 5, "radius": 30})
+        assert second_element["id"] != first_element["id"]
+
+
+def test_canvas_restore_puts_a_deleted_element_back(real_store):
+    store, MockProvider = real_store
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        element = _draw_via_tool_call(MockProvider, ws)
+        ws.send_json({"type": "canvas_delete", "element_id": element["id"]})
+        _recv(ws, "canvas_delete")
+        ws.send_json({"type": "canvas_restore", "element": element})
+        update = _recv(ws, "canvas_update")
+    assert update["element"]["id"] == element["id"]
+
+
+def test_canvas_restore_with_an_invalid_element_reports_a_clear_error(real_store):
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        ws.send_json({"type": "canvas_restore", "element": "not-a-dict"})
+        error = _recv(ws, "error")
+    assert "Invalid element" in error["message"]
+
+
+def test_list_models_returns_the_freellmapi_catalog(monkeypatch):
+    monkeypatch.delenv("FREELLMAPI_BASE_URL", raising=False)
+    with patch.object(server, "get_api_key", return_value="fla-key") as mock_get_key, \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "list_freellmapi_models", return_value=["auto", "nvidia/some-model"]) as mock_list:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "list_models", "provider": "freellmapi"})
+            msg = _recv(ws, "models")
+    mock_get_key.assert_any_call("freellmapi", ANY)
+    mock_list.assert_called_once_with("fla-key", server.FREELLMAPI_DEFAULT_BASE_URL)
+    assert msg == {"type": "models", "provider": "freellmapi", "items": ["auto", "nvidia/some-model"]}
+
+
+def test_list_models_freellmapi_uses_the_env_var_base_url_when_set(monkeypatch):
+    monkeypatch.setenv("FREELLMAPI_BASE_URL", "http://localhost:3002/v1")
+    with patch.object(server, "get_api_key", return_value="fla-key"), \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "list_freellmapi_models", return_value=[]) as mock_list:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "list_models", "provider": "freellmapi"})
+            _recv(ws, "models")
+    mock_list.assert_called_once_with("fla-key", "http://localhost:3002/v1")
+
+
+def test_set_model_switches_to_freellmapi_persists_and_takes_effect_immediately(monkeypatch):
+    monkeypatch.delenv("FREELLMAPI_BASE_URL", raising=False)
+    settings = _default_model_settings()
+    with patch.object(server, "get_api_key", return_value="fla-key") as mock_get_key, \
+         patch.object(server, "OpenRouterProvider"), \
+         patch.object(server, "FreeLLMAPIProvider") as MockFreeLLMAPI, \
+         patch.object(server, "Store") as MockStore, \
+         patch.object(server, "load_settings", return_value=settings), \
+         patch.object(server, "save_settings") as mock_save:
+        _configure(MockStore)
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "set_model", "provider": "freellmapi", "name": "auto"})
+            _recv(ws, "model_config")
+
+    mock_get_key.assert_any_call("freellmapi", ANY)
+    MockFreeLLMAPI.assert_called_once_with(
+        api_key="fla-key", model="auto", fallbacks=[], base_url=server.FREELLMAPI_DEFAULT_BASE_URL,
+    )
+    saved = mock_save.call_args[0][0]
+    assert saved["model"]["provider"] == "freellmapi"
+    assert saved["model"]["name"] == "auto"
+
+
+def test_provider_cls_and_kwargs_covers_all_three_providers(monkeypatch):
+    monkeypatch.delenv("FREELLMAPI_BASE_URL", raising=False)
+    assert server._provider_cls_and_kwargs("nvidia") == (server.NvidiaProvider, {})
+    assert server._provider_cls_and_kwargs("openrouter") == (server.OpenRouterProvider, {})
+    assert server._provider_cls_and_kwargs("anything-else") == (server.OpenRouterProvider, {})
+    cls, kwargs = server._provider_cls_and_kwargs("freellmapi")
+    assert cls is server.FreeLLMAPIProvider
+    assert kwargs == {"base_url": server.FREELLMAPI_DEFAULT_BASE_URL}
+
+
+def test_cancel_ask_auto_denies_an_already_pending_confirm(real_store):
+    """Cancelling while a tool's confirm dialog is already showing must not
+    leave the user stuck deciding it by hand -- cancel_ask itself resolves it
+    (denied), unblocking the background thread without any confirm_response
+    from the client at all."""
+    store, MockProvider = real_store
+    MockProvider.return_value.reply.side_effect = [
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "c1", "function": {"name": "delete_file", "arguments": '{"path": "x.txt"}'}}]},
+        {"role": "assistant", "content": "I did not delete the file since you cancelled."},
+    ]
+    with TestClient(server.app).websocket_connect("/ws") as ws:
+        ws.send_json({"type": "ask", "text": "delete x.txt"})
+        ws.receive_json()  # tool_call notification
+        confirm_msg = ws.receive_json()
+        assert confirm_msg["type"] == "confirm_request"
+        ws.send_json({"type": "cancel_ask"})
+        ack = _recv(ws, "cancel_requested")
+        settled = _recv(ws, "cancelled")  # no confirm_response ever sent for it
+    assert ack == {"type": "cancel_requested"}
+    assert settled == {"type": "cancelled"}
+
+
+def test_cancel_ask_auto_denies_a_confirm_requested_after_cancellation(real_store):
+    """A tool needing confirmation requested AFTER cancel_ask has already
+    been processed (the model's tool-call iteration was simply still in
+    flight) must be auto-denied too -- no confirm_request should even reach
+    the client, and the real tool function must never run. The release Event
+    pins down the ordering precisely: reply() only returns the tool_calls
+    message once cancel_requested (proof cancel_ask was fully handled) has
+    already arrived, so the confirm attempt that follows is unambiguously
+    "after cancellation", not a race."""
+    store, MockProvider = real_store
+    release = threading.Event()
+    calls = []
+
+    def fake_reply(messages, tools=None):
+        calls.append(1)
+        if len(calls) == 1:
+            release.wait(timeout=5)
+            return {"role": "assistant", "content": None,
+                    "tool_calls": [{"id": "c1", "function": {"name": "delete_file", "arguments": '{"path": "x.txt"}'}}]}
+        return {"role": "assistant", "content": "done anyway"}
+
+    MockProvider.return_value.reply.side_effect = fake_reply
+    deleted = []
+    with patch("raven.tools.TOOL_FUNCTIONS", {**__import__("raven.tools", fromlist=["x"]).TOOL_FUNCTIONS,
+                                              "delete_file": lambda path: deleted.append(path)}):
+        with TestClient(server.app).websocket_connect("/ws") as ws:
+            ws.send_json({"type": "ask", "text": "delete x.txt"})
+            ws.send_json({"type": "cancel_ask"})
+            ack = _recv(ws, "cancel_requested")
+            release.set()
+            settled = _recv(ws, "cancelled")
+    assert ack == {"type": "cancel_requested"}
+    assert settled == {"type": "cancelled"}
+    assert deleted == []  # auto-denied -- the real tool function never ran

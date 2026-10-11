@@ -11,7 +11,7 @@ import pytest
 from rich.console import Console
 
 import raven.cli as cli
-from raven import tools
+from raven import config, tools
 from raven.assistant import Assistant
 
 
@@ -481,7 +481,7 @@ def test_build_assistant_uses_nvidia_when_settings_json_says_so(settings_path):
          patch.object(cli, "Store") as MockStore:
         MockStore.return_value.load.return_value = []
         assistant, provider = cli.build_assistant(lambda action: True)
-    mock_get_key.assert_called_once_with("nvidia")
+    mock_get_key.assert_called_once_with("nvidia", cli.SETTINGS)
     MockOpenRouter.assert_not_called()
     # model settings merge one level deep with the defaults (config.load_settings),
     # so an override that only sets provider/name still inherits the default fallbacks.
@@ -545,3 +545,218 @@ def test_run_headless_never_registers_a_sudo_password_provider():
     with patch.object(cli, "build_assistant", return_value=(_FakeHeadlessAssistant("ok"), None)):
         cli.run_headless("hi", auto_confirm=True)
     assert tools._sudo_password_provider is None
+
+
+def test_build_assistant_uses_freellmapi_when_settings_json_says_so(settings_path, monkeypatch):
+    """settings.json's model.provider == "freellmapi" picks FreeLLMAPIProvider
+    and passes base_url from FREELLMAPI_BASE_URL (or the installer's own
+    default if that's unset) -- the integration this test guards against
+    regressing."""
+    import json
+    settings_path.write_text(json.dumps({"model": {"provider": "freellmapi", "name": "auto"}}))
+    monkeypatch.delenv("FREELLMAPI_BASE_URL", raising=False)
+    with patch.object(cli, "get_api_key", return_value="fla-key") as mock_get_key, \
+         patch.object(cli, "FreeLLMAPIProvider") as MockFreeLLMAPI, \
+         patch.object(cli, "OpenRouterProvider") as MockOpenRouter, \
+         patch.object(cli, "Store") as MockStore:
+        MockStore.return_value.load.return_value = []
+        assistant, provider = cli.build_assistant(lambda action: True)
+    mock_get_key.assert_called_once_with("freellmapi", cli.SETTINGS)
+    MockOpenRouter.assert_not_called()
+    from raven.config import DEFAULT_SETTINGS
+    from raven.llm_provider import FREELLMAPI_DEFAULT_BASE_URL
+    MockFreeLLMAPI.assert_called_once_with(
+        api_key="fla-key", model="auto", fallbacks=DEFAULT_SETTINGS["model"]["fallbacks"],
+        base_url=FREELLMAPI_DEFAULT_BASE_URL,
+    )
+    assert provider is MockFreeLLMAPI.return_value
+
+
+def test_build_assistant_freellmapi_base_url_is_overridable_by_env_var(settings_path, monkeypatch):
+    import json
+    settings_path.write_text(json.dumps({"model": {"provider": "freellmapi", "name": "auto"}}))
+    monkeypatch.setenv("FREELLMAPI_BASE_URL", "http://localhost:3002/v1")
+    with patch.object(cli, "get_api_key", return_value="fla-key"), \
+         patch.object(cli, "FreeLLMAPIProvider") as MockFreeLLMAPI, \
+         patch.object(cli, "Store") as MockStore:
+        MockStore.return_value.load.return_value = []
+        cli.build_assistant(lambda action: True)
+    assert MockFreeLLMAPI.call_args.kwargs["base_url"] == "http://localhost:3002/v1"
+
+
+# ---------------------------------------------------------------------------
+# /name, /provider, /apikey: release-prep settings commands that replace a
+# hardcoded user name and a hand-edited .env file.
+# ---------------------------------------------------------------------------
+
+def test_handle_name_reports_not_set_when_empty():
+    cli.console = Console(record=True, width=100)
+    cli.SETTINGS.clear()
+    cli.SETTINGS.update({"user": {"name": ""}})
+    cli.handle_name("")
+    assert "(not set)" in cli.console.export_text()
+
+
+def test_handle_name_sets_and_persists():
+    cli.console = Console(record=True, width=100)
+    cli.SETTINGS.clear()
+    cli.SETTINGS.update(config.load_settings())
+    cli.handle_name("Ely")
+    assert cli.SETTINGS["user"]["name"] == "Ely"
+    assert config.load_settings()["user"]["name"] == "Ely"
+
+
+def test_handle_provider_shows_current_when_no_args():
+    cli.console = Console(record=True, width=100)
+    cli.SETTINGS.clear()
+    cli.SETTINGS.update({"model": {"provider": "openrouter"}})
+    cli.handle_provider("")
+    assert "openrouter" in cli.console.export_text()
+
+
+def test_handle_provider_rejects_an_unknown_provider():
+    cli.console = Console(record=True, width=100)
+    cli.SETTINGS.clear()
+    cli.SETTINGS.update({"model": {"provider": "openrouter"}})
+    cli.ASSISTANT = Assistant(provider=None)
+    cli.handle_provider("openai")
+    assert "Unknown provider" in cli.console.export_text()
+
+
+def test_handle_provider_switches_and_rebuilds_the_live_provider():
+    cli.console = Console(record=True, width=100)
+    cli.SETTINGS.clear()
+    cli.SETTINGS.update({
+        "model": {"provider": "openrouter", "name": "openrouter/free", "fallbacks": []},
+        "api_keys": {"nvidia": "nv-key"},
+    })
+    cli.ASSISTANT = Assistant(provider=None)
+    with patch.object(cli, "NvidiaProvider") as MockNvidia:
+        cli.handle_provider("nvidia")
+    assert cli.SETTINGS["model"]["provider"] == "nvidia"
+    assert cli.ASSISTANT.provider is MockNvidia.return_value
+    assert config.load_settings()["model"]["provider"] == "nvidia"
+
+
+def test_handle_provider_leaves_the_current_model_untouched_when_the_new_one_has_no_key(monkeypatch):
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    cli.console = Console(record=True, width=100)
+    cli.SETTINGS.clear()
+    cli.SETTINGS.update({
+        "model": {"provider": "openrouter", "name": "openrouter/free", "fallbacks": []},
+        "api_keys": {},
+    })
+    cli.ASSISTANT = Assistant(provider=None)
+    old_provider = cli.ASSISTANT.provider
+    cli.handle_provider("nvidia")
+    assert cli.ASSISTANT.provider is old_provider
+    assert cli.SETTINGS["model"]["provider"] == "openrouter"  # never persisted
+    assert "Couldn't switch" in cli.console.export_text()
+
+
+def test_handle_apikey_cancels_on_blank_input():
+    cli.console = Console(record=True, width=100)
+    cli.SETTINGS.clear()
+    cli.SETTINGS.update({"model": {"provider": "openrouter"}})
+    cli.ASSISTANT = Assistant(provider=None)
+    with patch.object(cli.console, "input", return_value=""):
+        cli.handle_apikey("")
+    assert "Cancelled" in cli.console.export_text()
+
+
+def test_handle_apikey_rejects_an_unknown_provider():
+    cli.console = Console(record=True, width=100)
+    cli.ASSISTANT = Assistant(provider=None)
+    cli.handle_apikey("openai")
+    assert "Unknown provider" in cli.console.export_text()
+
+
+def test_handle_apikey_saves_and_applies_for_the_current_provider():
+    cli.console = Console(record=True, width=100)
+    cli.SETTINGS.clear()
+    cli.SETTINGS.update({
+        "model": {"provider": "openrouter", "name": "openrouter/free", "fallbacks": []},
+        "api_keys": {},
+    })
+    cli.ASSISTANT = Assistant(provider=None)
+    with patch.object(cli, "OpenRouterProvider") as MockOpenRouter, \
+         patch.object(cli.console, "input", return_value="sk-secret"):
+        cli.handle_apikey("")
+    assert cli.SETTINGS["api_keys"]["openrouter"] == "sk-secret"
+    assert config.load_settings()["api_keys"]["openrouter"] == "sk-secret"
+    assert cli.ASSISTANT.provider is MockOpenRouter.return_value
+    out = cli.console.export_text()
+    assert "sk-secret" not in out
+    assert "Saved" in out
+
+
+def test_handle_apikey_saves_for_a_different_provider_without_switching_to_it():
+    cli.console = Console(record=True, width=100)
+    cli.SETTINGS.clear()
+    cli.SETTINGS.update({
+        "model": {"provider": "openrouter", "name": "openrouter/free", "fallbacks": []},
+        "api_keys": {},
+    })
+    cli.ASSISTANT = Assistant(provider=None)
+    old_provider = cli.ASSISTANT.provider
+    with patch.object(cli.console, "input", return_value="nv-secret"):
+        cli.handle_apikey("nvidia")
+    assert cli.SETTINGS["api_keys"]["nvidia"] == "nv-secret"
+    assert cli.ASSISTANT.provider is old_provider  # not the active provider -- untouched
+
+
+# ---------------------------------------------------------------------------
+# First-run onboarding: name + provider + API key, so a fresh install never
+# requires hand-editing .env or settings.json.
+# ---------------------------------------------------------------------------
+
+def test_onboarding_needed_when_name_and_key_are_both_missing(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    settings = {"user": {"name": ""}, "model": {"provider": "openrouter"}, "api_keys": {}}
+    assert cli.onboarding_needed(settings) is True
+
+
+def test_onboarding_not_needed_once_name_and_key_are_set(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    settings = {"user": {"name": "Ely"}, "model": {"provider": "openrouter"}, "api_keys": {}}
+    assert cli.onboarding_needed(settings) is False
+
+
+def test_onboarding_needed_when_only_the_key_is_missing(monkeypatch):
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    settings = {"user": {"name": "Ely"}, "model": {"provider": "nvidia"}, "api_keys": {}}
+    assert cli.onboarding_needed(settings) is True
+
+
+def test_run_onboarding_only_asks_for_the_name_when_a_key_is_already_set(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    cli.console = Console(record=True, width=100)
+    settings = {"user": {"name": ""}, "model": {"provider": "openrouter", "name": "x", "fallbacks": []}, "api_keys": {}}
+    with patch.object(cli.console, "input", return_value="Ely") as mock_input:
+        cli.run_onboarding(cli.console, settings)
+    mock_input.assert_called_once()  # only the name prompt -- the key was already fine
+    assert settings["user"]["name"] == "Ely"
+    assert config.load_settings()["user"]["name"] == "Ely"
+
+
+def test_run_onboarding_asks_for_provider_and_key_when_none_is_set(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cli.console = Console(record=True, width=100)
+    settings = {"user": {"name": "Ely"}, "model": {"provider": "openrouter", "name": "x", "fallbacks": []}, "api_keys": {}}
+    with patch.object(cli.console, "input", side_effect=["nvidia", "nv-secret"]):
+        cli.run_onboarding(cli.console, settings)
+    assert settings["model"]["provider"] == "nvidia"
+    assert settings["api_keys"]["nvidia"] == "nv-secret"
+    saved = config.load_settings()
+    assert saved["model"]["provider"] == "nvidia"
+    assert saved["api_keys"]["nvidia"] == "nv-secret"
+
+
+def test_run_onboarding_blank_provider_choice_keeps_the_current_provider(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cli.console = Console(record=True, width=100)
+    settings = {"user": {"name": "Ely"}, "model": {"provider": "openrouter", "name": "x", "fallbacks": []}, "api_keys": {}}
+    with patch.object(cli.console, "input", side_effect=["", "or-secret"]):
+        cli.run_onboarding(cli.console, settings)
+    assert settings["model"]["provider"] == "openrouter"
+    assert settings["api_keys"]["openrouter"] == "or-secret"

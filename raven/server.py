@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import threading
 import uuid
 
@@ -12,8 +13,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from raven import voice
 from raven.assistant import Assistant
-from raven.config import get_api_key, load_settings, save_settings
-from raven.llm_provider import KNOWN_PROVIDERS, NvidiaProvider, OpenRouterProvider, list_nvidia_models
+from raven.config import get_api_key, get_user_name, load_settings, save_settings
+from raven.llm_provider import (
+    KNOWN_PROVIDERS, NvidiaProvider, OpenRouterProvider, FreeLLMAPIProvider,
+    FREELLMAPI_DEFAULT_BASE_URL, list_nvidia_models, list_freellmapi_models,
+)
 from raven.store import Store
 
 log = logging.getLogger("raven.server")
@@ -23,21 +27,46 @@ app = FastAPI()
 STATS_INTERVAL_S = 2.0   # Defines a 2s interval for stats refresh
 
 
-def _build_assistant(confirm_run_fn, on_tool_call_fn, store) -> Assistant:
-    """... (unchanged) ... Which LLMProvider subclass gets built (OpenRouter,
-    NVIDIA, ...) is settings.json's model.provider -- branched directly here
-    (not llm_provider.build_provider's shared PROVIDERS dict) so
+def _provider_cls_and_kwargs(provider_name: str) -> tuple[type, dict]:
+    """Which LLMProvider subclass + extra constructor kwargs for a given
+    settings.json model.provider -- the one place this module decides that,
+    used by both _build_assistant and _run_set_model so they can't drift
+    apart. Branches directly on the provider classes (not
+    llm_provider.build_provider's shared PROVIDERS dict) so
     `patch.object(server, "OpenRouterProvider")` keeps working in tests,
     same tradeoff cli.py's own build_assistant makes for the same reason."""
+    if provider_name == "nvidia":
+        return NvidiaProvider, {}
+    if provider_name == "freellmapi":
+        # base_url isn't a secret (unlike api_key), but IS machine-specific --
+        # the installer's own default port can already be taken by something
+        # else (confirmed live on this project's own dev machine), so it's a
+        # plain env var with a sensible default, not a settings.json field.
+        return FreeLLMAPIProvider, {"base_url": os.environ.get("FREELLMAPI_BASE_URL", FREELLMAPI_DEFAULT_BASE_URL)}
+    return OpenRouterProvider, {}
+
+
+def _build_assistant(confirm_run_fn, on_tool_call_fn, store,
+                      on_canvas_update_fn=None, on_canvas_delete_fn=None) -> Assistant:
+    """... (unchanged) ... Which LLMProvider subclass gets built (OpenRouter,
+    NVIDIA, FreeLLMAPI) is settings.json's model.provider -- see
+    _provider_cls_and_kwargs."""
     settings = load_settings()
     model_cfg = settings["model"]
     provider_name = model_cfg.get("provider", "openrouter")
-    api_key = get_api_key(provider_name)
-    provider_cls = NvidiaProvider if provider_name == "nvidia" else OpenRouterProvider
-    provider = provider_cls(api_key=api_key, model=model_cfg["name"], fallbacks=model_cfg.get("fallbacks", []))
+    api_key = get_api_key(provider_name, settings)
+    provider_cls, provider_kwargs = _provider_cls_and_kwargs(provider_name)
+    provider = provider_cls(
+        api_key=api_key, model=model_cfg["name"], fallbacks=model_cfg.get("fallbacks", []), **provider_kwargs
+    )
+    kwargs = {}
+    if on_canvas_update_fn is not None:
+        kwargs["on_canvas_update"] = on_canvas_update_fn
+    if on_canvas_delete_fn is not None:
+        kwargs["on_canvas_delete"] = on_canvas_delete_fn
     return Assistant(
         provider, confirm_run=confirm_run_fn, on_tool_call=on_tool_call_fn,
-        store=store, settings=settings,
+        store=store, settings=settings, **kwargs,
     )
 
 
@@ -79,7 +108,10 @@ class Session:
         self._pending_confirms: dict[str, tuple[threading.Event, dict]] = {}
         self._background_tasks: set[asyncio.Task] = set()
         self.store = Store()
-        self.assistant = _build_assistant(self._confirm_run, self._on_tool_call, self.store)
+        self.assistant = _build_assistant(
+            self._confirm_run, self._on_tool_call, self.store,
+            self._on_canvas_update, self._on_canvas_delete,
+        )
         self._stats_task: asyncio.Task | None = None   # NEW
         self._ask_token: _AskToken | None = None  # the in-flight ask(), if any -- see _AskToken
 
@@ -165,8 +197,22 @@ class Session:
     def _on_tool_call(self, name: str, args: dict) -> None:
         self._send({"type": "tool_call", "name": name, "args": args})
 
+    def _on_canvas_update(self, element: dict) -> None:
+        self._send({"type": "canvas_update", "element": element})
+
+    def _on_canvas_delete(self, element_id: str) -> None:
+        self._send({"type": "canvas_delete", "element_id": element_id})
+
     def _confirm_run(self, prompt: str) -> bool:
-        # ... (unchanged) ...
+        # A tool call that needs confirmation AFTER the user already cancelled
+        # this ask must never reach them for a real decision -- cancelling
+        # means "stop, discard whatever happens," not "pause until I decide
+        # whether this one specific action should still run." Auto-deny
+        # instead of sending confirm_request at all, so no dialog appears and
+        # the background thread doesn't sit waiting on a human who already
+        # said they're done with this turn.
+        if self._ask_token is not None and self._ask_token.cancelled:
+            return False
         confirm_id = str(uuid.uuid4())
         event = threading.Event()
         answer_box: dict = {"approved": False}
@@ -236,6 +282,14 @@ class Session:
                 await self.websocket.send_json({"type": "error", "message": "Nothing to cancel."})
                 return
             self._ask_token.cancelled = True
+            # A confirm_request from THIS turn may already be sitting in
+            # front of the user right now -- auto-deny it immediately rather
+            # than leaving it up to them (see _confirm_run's own matching
+            # check for one requested AFTER this point). Safe to resolve
+            # every pending confirm, not just "this turn's": only one ask
+            # runs at a time (enforced above), so anything still pending here
+            # belongs to the turn being cancelled.
+            self.resolve_all_pending(approved=False)
             # Acknowledges the request was received -- NOT that the turn has
             # settled (the underlying call is still genuinely running; only
             # _run_ask's own "cancelled" message, once it actually finishes,
@@ -261,6 +315,52 @@ class Session:
         if msg_type == "set_model":
             await self._run_set_model(data.get("provider", ""), data.get("name", ""))
             return
+        if msg_type == "get_user_config":
+            await self._send_user_config()
+            return
+        if msg_type == "set_api_key":
+            await self._run_set_api_key(data.get("provider", ""), data.get("key", ""))
+            return
+        if msg_type == "set_user_name":
+            await self._run_set_user_name(data.get("name", ""))
+            return
+        if msg_type == "get_canvas":
+            await self._send_canvas()
+            return
+        if msg_type == "canvas_edit":
+            # A hand-edit (drag/resize/rotate/recolor/reparametrize/reorder)
+            # bypasses the model entirely -- Assistant.apply_canvas_edit
+            # persists it and (via _on_canvas_update, bound in __init__)
+            # pushes the authoritative, regenerated element back, which is
+            # also how the sender's own optimistic UI state reconciles.
+            el = self.assistant.apply_canvas_edit(data.get("element_id", ""), data.get("patch") or {})
+            if el is None:
+                await self.websocket.send_json({"type": "error", "message": "No such canvas element."})
+            return
+        if msg_type == "canvas_delete":
+            if not self.assistant.delete_canvas_element_by_user(data.get("element_id", "")):
+                await self.websocket.send_json({"type": "error", "message": "No such canvas element."})
+            return
+        if msg_type == "canvas_restore":
+            # The undo half of canvas_delete -- the client kept the exact
+            # element it asked to delete, so undo just hands it straight
+            # back rather than the server needing its own undo history.
+            element = data.get("element") or {}
+            if not isinstance(element, dict) or "id" not in element:
+                await self.websocket.send_json({"type": "error", "message": "Invalid element to restore."})
+                return
+            self.assistant.restore_element(element)
+            return
+        if msg_type == "canvas_group":
+            if self.assistant.group_elements(data.get("element_ids") or []) is None:
+                await self.websocket.send_json(
+                    {"type": "error", "message": "Need at least 2 existing elements to group."}
+                )
+            return
+        if msg_type == "canvas_ungroup":
+            if self.assistant.ungroup_elements(data.get("group_id", "")) is None:
+                await self.websocket.send_json({"type": "error", "message": "No such group."})
+            return
         await self.websocket.send_json({"type": "error", "message": f"Unknown message type: {msg_type}"})
 
     # -- chat sessions (unchanged) ------------------------------------------
@@ -268,7 +368,10 @@ class Session:
     def _switch_to(self, session_id: int) -> None:
         old = self.store
         self.store = Store(session_id=session_id)
-        self.assistant = _build_assistant(self._confirm_run, self._on_tool_call, self.store)
+        self.assistant = _build_assistant(
+            self._confirm_run, self._on_tool_call, self.store,
+            self._on_canvas_update, self._on_canvas_delete,
+        )
         try:
             old.close()
         except Exception:  # noqa: BLE001
@@ -300,11 +403,17 @@ class Session:
             "type": "history", "session": self.store.session_id,
             "items": history_items(self.assistant.history),
         })
+        await self._send_canvas()                       # Design mode: restore this session's canvas too
         await self._send_stats()                       # NEW -- populate on connect / switch
 
     async def _send_sessions(self) -> None:
         await self.websocket.send_json({
             "type": "sessions", "current": self.store.session_id, "items": self.store.list_sessions(),
+        })
+
+    async def _send_canvas(self) -> None:
+        await self.websocket.send_json({
+            "type": "canvas", "session": self.store.session_id, "elements": self.assistant.canvas,
         })
 
     async def _run_ask(self, text: str, token: _AskToken) -> None:
@@ -405,17 +514,22 @@ class Session:
         })
 
     async def _run_list_models(self, provider_name: str) -> None:
-        if provider_name != "nvidia":
-            # Only NVIDIA exposes a listable catalog via this key today; OpenRouter's
-            # model is still chosen by editing settings.json directly (see README).
+        if provider_name not in ("nvidia", "freellmapi"):
+            # OpenRouter's model is still chosen by editing settings.json
+            # directly (see README) -- it has no listable-catalog endpoint
+            # this picker uses.
             await self.websocket.send_json({
                 "type": "models_error", "provider": provider_name,
                 "message": f"Listing models isn't supported for provider {provider_name!r}.",
             })
             return
         try:
-            api_key = get_api_key("nvidia")
-            models = await asyncio.to_thread(list_nvidia_models, api_key)
+            api_key = get_api_key(provider_name, load_settings())
+            if provider_name == "freellmapi":
+                base_url = os.environ.get("FREELLMAPI_BASE_URL", FREELLMAPI_DEFAULT_BASE_URL)
+                models = await asyncio.to_thread(list_freellmapi_models, api_key, base_url)
+            else:
+                models = await asyncio.to_thread(list_nvidia_models, api_key)
         except Exception as e:  # noqa: BLE001 -- always report to the UI, never drop the request silently
             await self.websocket.send_json({"type": "models_error", "provider": provider_name, "message": str(e)})
             return
@@ -441,9 +555,9 @@ class Session:
         new_fallbacks = settings["model"].get("fallbacks", []) if provider_name == was_provider else []
         new_model_cfg = {**settings["model"], "provider": provider_name, "name": name, "fallbacks": new_fallbacks}
         try:
-            api_key = get_api_key(provider_name)
-            provider_cls = NvidiaProvider if provider_name == "nvidia" else OpenRouterProvider
-            new_provider = provider_cls(api_key=api_key, model=name, fallbacks=new_fallbacks)
+            api_key = get_api_key(provider_name, settings)
+            provider_cls, provider_kwargs = _provider_cls_and_kwargs(provider_name)
+            new_provider = provider_cls(api_key=api_key, model=name, fallbacks=new_fallbacks, **provider_kwargs)
         except Exception as e:  # noqa: BLE001 -- validated BEFORE persisting/swapping, so a bad
             # choice (missing key, ...) leaves the current, working model untouched.
             await self.websocket.send_json({"type": "error", "message": str(e)})
@@ -453,6 +567,49 @@ class Session:
         self.assistant.provider = new_provider
         await self._send_model_config()
         await self._send_stats()  # refresh the "Current model" segment immediately
+
+    # -- user name + API keys (desktop Settings panel) --------------------------
+    # Lets a fresh install be fully configured from the UI -- no .env file, no
+    # hand-edited settings.json. The key itself is never echoed back to the
+    # client once saved (_send_user_config reports only whether one is SET per
+    # provider, not its value) -- same "don't round-trip secrets" posture as
+    # every other credential in this project.
+
+    async def _send_user_config(self) -> None:
+        settings = load_settings()
+        has_key = {p: bool(settings.get("api_keys", {}).get(p, "").strip()) for p in KNOWN_PROVIDERS}
+        await self.websocket.send_json({
+            "type": "user_config", "name": get_user_name(settings), "has_key": has_key,
+        })
+
+    async def _run_set_api_key(self, provider_name: str, key: str) -> None:
+        if provider_name not in KNOWN_PROVIDERS:
+            await self.websocket.send_json({
+                "type": "error",
+                "message": f"Unknown model provider: {provider_name!r}. Known providers: {', '.join(KNOWN_PROVIDERS)}.",
+            })
+            return
+        if not key.strip():
+            await self.websocket.send_json({"type": "error", "message": "An API key is required."})
+            return
+        settings = load_settings()
+        settings.setdefault("api_keys", {})[provider_name] = key.strip()
+        save_settings(settings)
+        # Apply immediately if this is the provider currently in use -- same
+        # "takes effect now, not just after a restart" posture as set_model.
+        if provider_name == settings["model"].get("provider", "openrouter"):
+            provider_cls, provider_kwargs = _provider_cls_and_kwargs(provider_name)
+            self.assistant.provider = provider_cls(
+                api_key=key.strip(), model=settings["model"]["name"],
+                fallbacks=settings["model"].get("fallbacks", []), **provider_kwargs,
+            )
+        await self._send_user_config()
+
+    async def _run_set_user_name(self, name: str) -> None:
+        settings = load_settings()
+        settings.setdefault("user", {})["name"] = name.strip()
+        save_settings(settings)
+        await self._send_user_config()
 
 
 @app.websocket("/ws")

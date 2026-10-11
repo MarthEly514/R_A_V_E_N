@@ -601,6 +601,150 @@ def close_window(title: str) -> str:
     return f"Closed window: {win['title']}"
 
 
+# Design mode (mathematically-generated shapes on the desktop app's canvas):
+# every one of these names is intercepted in Assistant._run_tool -- same
+# reason load_skill/analyze_image are -- since drawing/editing/reading the
+# canvas needs live access to self.canvas and self.on_canvas_update, which a
+# plain module-level function has no way to reach. Registered here anyway
+# (spec + a shared placeholder) purely so they flow through the normal
+# skill-gating/registry machinery and satisfy the "every spec has a callable"
+# registry test, the same posture analyze_image's own placeholder documents.
+_PLACEMENT_PROPS = {
+    "x": {"type": "number", "description": "Canvas x position of the shape's center (default 0)"},
+    "y": {"type": "number", "description": "Canvas y position of the shape's center (default 0)"},
+    "rotation": {"type": "number", "description": "Rotation in degrees about the shape's own center (default 0)"},
+    "fill": {"type": "string", "description": "Fill color, e.g. '#2563eb' or 'none' (default a dark neutral)"},
+    "stroke": {"type": "string", "description": "Stroke color, e.g. '#2563eb' or 'none' (default 'none')"},
+    "stroke_width": {"type": "number", "description": "Stroke width in canvas units (default 1)"},
+}
+
+
+def _design_tool_placeholder(**_kwargs) -> str:
+    """Never actually called -- see the module comment above DESIGN_TOOL_SPECS."""
+    raise RuntimeError("design tools are handled by Assistant._run_tool, not dispatched here")
+
+
+DESIGN_TOOL_SPECS = [
+    {"type": "function", "function": {
+        "name": "draw_golden_rectangle",
+        "description": "Draw a rectangle whose sides are in the golden ratio (~1.618:1) -- a "
+                       "classically balanced proportion for logos and layout blocks.",
+        "parameters": {"type": "object", "properties": {
+            "width": {"type": "number", "description": "Width in canvas units (default 160)"},
+            **_PLACEMENT_PROPS}},
+    }},
+    {"type": "function", "function": {
+        "name": "draw_golden_spiral",
+        "description": "Draw a logarithmic spiral that grows by the golden ratio every quarter "
+                       "turn -- the classic 'nautilus shell' golden spiral.",
+        "parameters": {"type": "object", "properties": {
+            "size": {"type": "number", "description": "Outer radius in canvas units (default 120)"},
+            "turns": {"type": "number", "description": "Number of full turns (default 3)"},
+            **_PLACEMENT_PROPS}},
+    }},
+    {"type": "function", "function": {
+        "name": "draw_polygon",
+        "description": "Draw a regular N-sided polygon (triangle, pentagon, hexagon, ...), vertices "
+                       "evenly spaced around a circle.",
+        "parameters": {"type": "object", "properties": {
+            "sides": {"type": "integer", "description": "Number of sides, minimum 3 (default 6)"},
+            "radius": {"type": "number", "description": "Radius to each vertex (default 80)"},
+            **_PLACEMENT_PROPS}},
+    }},
+    {"type": "function", "function": {
+        "name": "draw_star",
+        "description": "Draw an N-pointed star polygon (alternating outer and inner vertices).",
+        "parameters": {"type": "object", "properties": {
+            "points": {"type": "integer", "description": "Number of star points, minimum 3 (default 5)"},
+            "outer_radius": {"type": "number", "description": "Radius to each point's tip (default 100)"},
+            "inner_radius": {"type": "number", "description": "Radius to each inner vertex (default 40)"},
+            **_PLACEMENT_PROPS}},
+    }},
+    {"type": "function", "function": {
+        "name": "draw_radial_pattern",
+        "description": "Repeat a motif shape evenly around a shared center -- the mandala/rosette "
+                       "primitive for radially symmetric marks and patterns. The motif itself is "
+                       "one of the other generators' own parameters, given by name.",
+        "parameters": {"type": "object", "properties": {
+            "motif": {"type": "string", "enum": ["golden_rectangle", "regular_polygon", "star_polygon"],
+                      "description": "Which generator produces the repeated motif"},
+            "motif_params": {"type": "object",
+                             "description": "Parameters for that generator, e.g. {\"sides\": 6, \"radius\": 20} "
+                                            "for regular_polygon"},
+            "repetitions": {"type": "integer", "description": "How many copies around the circle (default 6)"},
+            "orbit_radius": {"type": "number", "description": "Distance of each copy from the center (default 0)"},
+            "spin_with_orbit": {"type": "boolean",
+                                "description": "Rotate each copy to face outward, petal-style (default true)"},
+            **_PLACEMENT_PROPS},
+            "required": ["motif", "motif_params"]},
+    }},
+    {"type": "function", "function": {
+        "name": "draw_grid",
+        "description": "Draw a column/row grid of empty placeholder cells -- a layout aid for "
+                       "interface mockups, not shape content by itself.",
+        "parameters": {"type": "object", "properties": {
+            "rows": {"type": "integer", "description": "Number of rows (default 3)"},
+            "cols": {"type": "integer", "description": "Number of columns (default 3)"},
+            "cell_width": {"type": "number", "description": "Width of each cell (default 80)"},
+            "cell_height": {"type": "number", "description": "Height of each cell (default 80)"},
+            "gutter": {"type": "number", "description": "Gap between cells (default 12)"},
+            "x": _PLACEMENT_PROPS["x"], "y": _PLACEMENT_PROPS["y"], "rotation": _PLACEMENT_PROPS["rotation"]}},
+    }},
+    {"type": "function", "function": {
+        "name": "draw_bezier",
+        "description": "Draw a smooth Bezier curve through 2 (straight line), 3 (quadratic), or 4 "
+                       "(cubic) control points.",
+        "parameters": {"type": "object", "properties": {
+            "control_points": {"type": "array", "items": {"type": "array", "items": {"type": "number"}},
+                               "description": "2-4 [x, y] control points, in canvas units"},
+            **_PLACEMENT_PROPS},
+            "required": ["control_points"]},
+    }},
+    {"type": "function", "function": {
+        "name": "draw_lissajous",
+        "description": "Draw a Lissajous curve (x = A*sin(a*t+delta), y = A*sin(b*t)) -- integer "
+                       "a:b ratios give classic closed decorative loops.",
+        "parameters": {"type": "object", "properties": {
+            "a": {"type": "number", "description": "x-frequency (default 3)"},
+            "b": {"type": "number", "description": "y-frequency (default 2)"},
+            "delta": {"type": "number", "description": "Phase offset in radians (default pi/2)"},
+            "amplitude": {"type": "number", "description": "Half-width/height of the curve (default 100)"},
+            **_PLACEMENT_PROPS}},
+    }},
+    {"type": "function", "function": {
+        "name": "list_canvas_elements",
+        "description": "List every shape currently on the Design canvas (id, type, position, "
+                       "params, fill/stroke) -- including any the user has since moved, resized, "
+                       "recolored, or reparametrized by hand. Call this before assuming you know "
+                       "the canvas's current state; a short summary of the user's own recent edits "
+                       "is already added to context automatically, but this is the full picture.",
+        "parameters": {"type": "object", "properties": {}},
+    }},
+    {"type": "function", "function": {
+        "name": "update_canvas_element",
+        "description": "Change an existing shape's params (e.g. sides, radius, turns) and/or "
+                       "position/rotation/fill/stroke. Geometry is always regenerated from params, "
+                       "so this is how you resize/reshape something already drawn rather than "
+                       "deleting and redrawing it.",
+        "parameters": {"type": "object", "properties": {
+            "element_id": {"type": "string", "description": "The shape's id, from list_canvas_elements"},
+            "patch": {"type": "object",
+                     "description": "Fields to change, e.g. {\"params\": {\"sides\": 8}} or "
+                                    "{\"x\": 300, \"fill\": \"#ff0000\"}"}},
+            "required": ["element_id", "patch"]},
+    }},
+    {"type": "function", "function": {
+        "name": "delete_canvas_element",
+        "description": "Remove a shape from the Design canvas. No confirmation needed -- this only "
+                       "touches the session's own canvas, and is trivially undone (Ctrl+Z in the "
+                       "UI, or just ask to redraw it).",
+        "parameters": {"type": "object", "properties": {
+            "element_id": {"type": "string", "description": "The shape's id, from list_canvas_elements"}},
+            "required": ["element_id"]},
+    }},
+]
+
+
 TOOL_FUNCTIONS = {
     "read_file": read_file,
     "write_file": write_file,
@@ -636,6 +780,7 @@ TOOL_FUNCTIONS = {
     "gmail_read_message": _gmail.read_message,
     "gmail_send_message": _gmail.send_message,
     "gmail_reply_message": _gmail.reply_message,
+    **{spec["function"]["name"]: _design_tool_placeholder for spec in DESIGN_TOOL_SPECS},
 }
 
 TOOL_SPECS = [
@@ -972,7 +1117,7 @@ TOOL_SPECS = [
             "body": {"type": "string", "description": "Reply text"}},
             "required": ["message_id", "body"]},
     }},
-]
+] + DESIGN_TOOL_SPECS
 
 
 # D2: tool-spec grouping so only "core" (file I/O, search, shell, coding,
@@ -993,6 +1138,7 @@ SKILLS = {
     # a browser_screenshot capture. A browser-screenshot-then-analyze
     # workflow needs both skills loaded; each stays single-purpose.
     "vision": ["analyze_image"],
+    "design": [spec["function"]["name"] for spec in DESIGN_TOOL_SPECS],
 }
 SKILL_DESCRIPTIONS = {
     "desktop": "open/close desktop applications and windows",
@@ -1000,6 +1146,8 @@ SKILL_DESCRIPTIONS = {
     "browser": "navigate/read/click/type/submit/screenshot in a real, interactive browser session",
     "gmail": "read, send, and reply to the user's Gmail",
     "vision": "look at an image file and answer a question about it",
+    "design": "draw mathematically-generated shapes (golden ratio, polygons, stars, mandalas, "
+              "grids, parametric curves) onto the Design canvas, and read/edit/delete what's there",
 }
 
 

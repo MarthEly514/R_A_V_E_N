@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useSettings, type Theme } from '../useSettings';
-import type { ModelConfig } from '../useRaven';
+import type { ModelConfig, UserConfig } from '../useRaven';
 
 interface SettingsPanelProps {
   onClose: () => void;
@@ -12,6 +12,10 @@ interface SettingsPanelProps {
   getModelConfig: () => void;
   listModels: (provider: string) => void;
   setModel: (provider: string, name: string) => void;
+  userConfig: UserConfig | null;
+  getUserConfig: () => void;
+  setApiKey: (provider: string, key: string) => void;
+  setUserName: (name: string) => void;
 }
 
 const THEME_OPTIONS: { value: Theme; label: string }[] = [
@@ -37,7 +41,7 @@ const PROVIDER_OPTIONS: { value: string; label: string }[] = [
  */
 function SettingsPanel({
   onClose, connected, modelConfig, modelsByProvider, modelsLoading, modelsError,
-  getModelConfig, listModels, setModel,
+  getModelConfig, listModels, setModel, userConfig, getUserConfig, setApiKey, setUserName,
 }: SettingsPanelProps) {
   const { theme, setTheme, voiceAutoSend, setVoiceAutoSend, reduceMotion, setReduceMotion, showStats, setShowStats } =
     useSettings();
@@ -49,13 +53,40 @@ function SettingsPanel({
   const [pickedModel, setPickedModel] = useState('');
   const [justSaved, setJustSaved] = useState(false);
 
+  // The API key field is write-only -- user_config only ever reports
+  // whether a key is SET per provider (has_key), never the value itself, so
+  // this starts empty every time and is cleared again right after saving.
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [keyJustSaved, setKeyJustSaved] = useState(false);
+  const [nameInput, setNameInput] = useState('');
+  const [nameJustSaved, setNameJustSaved] = useState(false);
+
   const provider = pickedProvider ?? modelConfig?.provider ?? 'openrouter';
   const models = modelsByProvider[provider] ?? [];
 
   useEffect(() => {
     getModelConfig();
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- once, on open; getModelConfig is a stable useCallback
+    getUserConfig();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once, on open; both are stable useCallbacks
   }, []);
+
+  useEffect(() => {
+    if (userConfig) setNameInput(userConfig.name);
+  }, [userConfig]);
+
+  const hasKey = userConfig?.has_key?.[provider] ?? false;
+
+  const saveApiKey = () => {
+    if (!apiKeyInput.trim()) return;
+    setApiKey(provider, apiKeyInput.trim());
+    setApiKeyInput('');
+    setKeyJustSaved(true);
+  };
+
+  const saveName = () => {
+    setUserName(nameInput.trim());
+    setNameJustSaved(true);
+  };
 
   useEffect(() => {
     // Seed the text field with the current model once we know it, but only
@@ -81,6 +112,8 @@ function SettingsPanel({
     setPickedProvider(value);
     setPickedModel(value === modelConfig?.provider ? modelConfig.name : '');
     setJustSaved(false);
+    setApiKeyInput('');
+    setKeyJustSaved(false);
   };
 
   const applyModel = () => {
@@ -157,6 +190,39 @@ function SettingsPanel({
               ))}
             </div>
 
+            <div className="mb-3">
+              <div className="mb-1.5 flex items-center justify-between">
+                <span className="text-[0.78rem] text-ink-dim">
+                  API key{' '}
+                  {hasKey ? (
+                    <span className="text-ink">(set)</span>
+                  ) : (
+                    <span className="text-danger">(not set)</span>
+                  )}
+                </span>
+              </div>
+              <div className="flex gap-2">
+                <input
+                  type="password"
+                  value={apiKeyInput}
+                  onChange={(e) => {
+                    setApiKeyInput(e.target.value);
+                    setKeyJustSaved(false);
+                  }}
+                  placeholder={hasKey ? 'Paste a new key to replace it' : `Paste your ${provider} API key`}
+                  autoComplete="off"
+                  className="flex-1 border border-line bg-panel px-3 py-2 text-[0.85rem] outline-none focus:border-ink"
+                />
+                <button
+                  onClick={saveApiKey}
+                  disabled={!connected || !apiKeyInput.trim()}
+                  className="cursor-pointer border border-ink px-3 py-2 text-[0.82rem] font-semibold text-ink hover:bg-ink/10 disabled:cursor-not-allowed disabled:opacity-45"
+                >
+                  {keyJustSaved ? 'Saved' : 'Save'}
+                </button>
+              </div>
+            </div>
+
             {provider === 'nvidia' ? (
               <>
                 <div className="mb-1.5 flex items-center justify-between">
@@ -217,6 +283,28 @@ function SettingsPanel({
             >
               {justSaved && isCurrentChoice ? 'Applied' : 'Use this model'}
             </button>
+          </section>
+
+          <section className="mb-6">
+            <div className="mb-2.5 text-[0.78rem] text-ink-dim">Your name</div>
+            <div className="flex gap-2">
+              <input
+                value={nameInput}
+                onChange={(e) => {
+                  setNameInput(e.target.value);
+                  setNameJustSaved(false);
+                }}
+                placeholder="What should R.A.V.E.N call you?"
+                className="flex-1 border border-line bg-panel px-3 py-2 text-[0.85rem] outline-none focus:border-ink"
+              />
+              <button
+                onClick={saveName}
+                disabled={!connected || nameInput.trim() === (userConfig?.name ?? '')}
+                className="cursor-pointer border border-ink px-3 py-2 text-[0.82rem] font-semibold text-ink hover:bg-ink/10 disabled:cursor-not-allowed disabled:opacity-45"
+              >
+                {nameJustSaved ? 'Saved' : 'Save'}
+              </button>
+            </div>
           </section>
 
           <section className="flex flex-col gap-3">

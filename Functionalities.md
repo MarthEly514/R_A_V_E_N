@@ -394,6 +394,56 @@ subprocess error, timeout) internally, since a missed notification must never br
 confirmation/reply it was announcing. macOS/Windows are unconfirmed on real hardware, same
 honest posture as the rest of `platforms/` (Step 3.57).
 
+### Design mode: a mathematical drawing playground (Step 3.76)
+
+A new `"design"` skill (`raven/tools.py`) and a Figma-like SVG canvas in the desktop app
+(`raven_ui/src/stages/DesignStage.tsx`, wired into `App.tsx`'s previously-empty `mode ===
+'design'` branch). Every shape is generated server-side by a pure `params -> geometry`
+function in the new `raven/design.py`:
+
+| Tool | Generator | Produces |
+|---|---|---|
+| `draw_golden_rectangle` | `golden_rectangle` | a rectangle in golden-ratio proportions |
+| `draw_golden_spiral` | `golden_spiral` | a logarithmic spiral (golden-ratio growth) |
+| `draw_polygon` | `regular_polygon` | an N-sided regular polygon |
+| `draw_star` | `star_polygon` | an N-pointed star |
+| `draw_radial_pattern` | `radial_pattern` | a motif repeated evenly around a center (mandalas) |
+| `draw_grid` | `grid_layout` | an empty column/row grid of placeholder cells |
+| `draw_bezier` | `bezier_curve` | a 2/3/4-control-point line/quadratic/cubic curve |
+| `draw_lissajous` | `lissajous_curve` | a closed parametric decorative loop |
+
+Plus `list_canvas_elements`/`update_canvas_element`/`delete_canvas_element` to read/edit/
+remove what's already drawn. All 11 are intercepted in `Assistant._run_tool` (same pattern
+as `load_skill`/`analyze_image`) since they need live `self.canvas` access; **none require
+confirmation** -- they only ever touch this session's own saved canvas, never anything
+external. Every element's rendered geometry (points/path data) is always *derived* from its
+own numeric `params` (sides, radius, turns, control points, ...) by re-running the same
+generator -- editing a shape later (by R.A.V.E.N or by hand in the UI) regenerates it exactly,
+never approximates it.
+
+The canvas persists per chat session (a new `canvas_elements` table in `raven/store.py`,
+alongside `messages`) and is pushed to the UI live as R.A.V.E.N draws (a `canvas_update`
+websocket message per element, not just once the whole reply arrives). The UI supports
+click/shift-click multi-select, drag-to-move, resize handles (regenerating a shape's own
+"primary size" param where one exists, e.g. a polygon's `radius`), a rotate handle, a layers
+panel (z-order + delete), a properties panel (numeric params + fill/stroke color), group/
+ungroup (a group carries its own position/rotation/scale on top of each child's still-
+independent params -- ungrouping bakes that back onto each child exactly), pan (space+drag)
+and zoom (wheel, around the cursor), and a client-side undo/redo stack that replays the same
+edit/delete/restore calls a live action would make, so the server stays authoritative
+throughout. Hand-edits you make in the UI are summarized into R.A.V.E.N's context
+automatically before her next reply (`[Canvas changed since your last turn: ...]`), so asking
+her to act on something you just moved or recolored doesn't rely on stale information.
+Built entirely in plain SVG + pointer events, no new frontend dependency. The canvas itself
+is visually delimited: the SVG viewport has a plain border, and a second, non-interactive
+rect marks the canvas's actual fixed extent regardless of pan/zoom, so it's always clear
+where the drawing surface is even after scrolling away from it.
+
+Numeric tool arguments are defensively coerced (`Assistant._coerce_numeric_strings`, Step
+3.77) before reaching any generator -- some models send them as JSON strings (`"80"` instead
+of `80`) despite the tool spec declaring a numeric type, which crashed every draw call before
+this existed (a real, live-confirmed failure mode, not a hypothetical one).
+
 ---
 
 ## Skills (D2)
@@ -609,6 +659,20 @@ to the prompt text.
   `OpenRouterProvider` or `NvidiaProvider` (`raven/llm_provider.py`); default
   is `"openrouter"`. Each reads its own API key from its own env var, so
   switching one never touches the other's.
+- **No .env required (Step 3.80, release prep):** `config.get_api_key(provider,
+  settings)` checks `settings.json`'s `api_keys` section FIRST, falling back
+  to the env var only if that's empty — a key saved via the CLI's first-run
+  onboarding / `/apikey`, or the desktop app's Settings panel, always wins.
+  The CLI runs onboarding automatically on first launch (no name set, or no
+  key for the configured provider): asks for the user's name once, then a
+  provider + key if none is configured, and saves both. `/name [name]`,
+  `/provider [name]`, `/apikey [provider]` change any of it later without a
+  restart — each rebuilds the live `Assistant.provider` in place when it's
+  the active provider, same posture as the desktop app's `set_model`. The
+  desktop app's Settings panel gets the same two fields (an API key input per
+  provider, and a "Your name" field) via new `get_user_config`/`set_api_key`/
+  `set_user_name` server messages — `has_key` booleans only, the key itself is
+  never echoed back once saved.
   - **OpenRouter:** one request lists all candidate models
     (`model.name` + `model.fallbacks`); OpenRouter tries them in order
     server-side. Defaults: `nvidia/nemotron-3.5-lightning:free`, falling back
@@ -636,7 +700,8 @@ to the prompt text.
   round trips (and `NvidiaProvider`'s own back-to-back fallback calls).
 - **Token accounting** comes from the API's `usage` figures.
 - **Settings** (all optional) live in `~/.raven/settings.json`: `model.provider`,
-  `model.name`, `model.fallbacks`, `statusline.segments`.
+  `model.name`, `model.fallbacks`, `statusline.segments`, `api_keys` (per
+  provider), `user.name`.
 - **Swappable provider:** implement `LLMProvider.reply()` in
   `raven/llm_provider.py`; `cli.py`/`server.py` each branch on
   `model.provider` to pick the class.
@@ -652,7 +717,7 @@ to the prompt text.
 
 | Path | Purpose |
 |---|---|
-| `.env` (project) | `OPENROUTER_API_KEY`, and `NVIDIA_API_KEY` if using that provider |
+| `.env` (project) | Optional fallback for `OPENROUTER_API_KEY`/`NVIDIA_API_KEY`/`FREELLMAPI_API_KEY` -- `~/.raven/settings.json`'s `api_keys` (set via onboarding, `/apikey`, or the desktop Settings panel) takes precedence |
 | `RAVEN.md` (project) | Optional project-specific rules, loaded into the system prompt |
 | `~/.raven/RAVEN.md` | Optional user-wide rules, loaded into every project's system prompt |
 | `~/.raven/history.db` | Conversation history |

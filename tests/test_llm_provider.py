@@ -4,7 +4,10 @@ Path.home()) so this suite can never accidentally pick up a real RAVEN.md."""
 import pytest
 
 from raven import llm_provider
-from raven.llm_provider import NvidiaProvider, OpenRouterProvider, build_system_prompt, list_nvidia_models, load_project_rules
+from raven.llm_provider import (
+    NvidiaProvider, OpenRouterProvider, FreeLLMAPIProvider, FREELLMAPI_DEFAULT_BASE_URL,
+    build_system_prompt, list_nvidia_models, list_freellmapi_models, load_project_rules,
+)
 
 
 def test_no_rules_files_is_silent(tmp_path):
@@ -303,11 +306,12 @@ def test_llm_provider_base_class_declares_reply_with_image_as_a_typed_but_unsupp
 # ---------------------------------------------------------------------------
 
 class _FakeResponse:
-    def __init__(self, status_code=200, payload=None, text=""):
+    def __init__(self, status_code=200, payload=None, text="", headers=None):
         self.status_code = status_code
         self.ok = 200 <= status_code < 300
         self._payload = payload
         self.text = text
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
@@ -517,3 +521,136 @@ def test_list_nvidia_models_reports_an_unexpected_shape_clearly(monkeypatch):
     monkeypatch.setattr(llm_provider.requests, "get", lambda **kw: _FakeResponse(200, {"unexpected": "shape"}))
     with pytest.raises(RuntimeError, match="Unexpected response"):
         list_nvidia_models("nv-key")
+
+
+# ---------------------------------------------------------------------------
+# FreeLLMAPIProvider: a self-hosted router (github.com/tashfeenahmed/freellmapi)
+# pooling many free providers behind one OpenAI-compatible endpoint, with its
+# own failover/malformed-tool-call rescue -- see Step in DEV_LOG for why.
+# ---------------------------------------------------------------------------
+
+def test_freellmapi_defaults_to_auto_and_the_installer_default_base_url():
+    provider = FreeLLMAPIProvider(api_key="k", system_prompt="SYS")
+    assert provider.model == "auto"
+    assert provider.base_url == FREELLMAPI_DEFAULT_BASE_URL
+
+
+def test_freellmapi_reply_sends_a_single_model_field_to_the_configured_base_url(monkeypatch):
+    captured = {}
+
+    def fake_post(url, headers, json, timeout):
+        captured["url"], captured["headers"], captured["payload"] = url, headers, json
+        return _chat_response()
+
+    provider = FreeLLMAPIProvider(
+        api_key="fla-key", model="auto", system_prompt="SYS", base_url="http://localhost:3002/v1",
+    )
+    monkeypatch.setattr(provider._session, "post", fake_post)
+    provider.reply([{"role": "user", "content": "hi"}])
+
+    assert captured["url"] == "http://localhost:3002/v1/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer fla-key"
+    assert captured["payload"]["model"] == "auto"
+    assert "models" not in captured["payload"]  # not OpenRouter's multi-model extension
+    assert captured["payload"]["messages"][0] == {"role": "system", "content": "SYS"}
+
+
+def test_freellmapi_base_url_trailing_slash_is_tolerated(monkeypatch):
+    captured = {}
+    provider = FreeLLMAPIProvider(api_key="k", system_prompt="SYS", base_url="http://localhost:3002/v1/")
+    monkeypatch.setattr(provider._session, "post", lambda **kw: (captured.update(kw) or _chat_response()))
+    provider.reply([{"role": "user", "content": "hi"}])
+    assert captured["url"] == "http://localhost:3002/v1/chat/completions"
+
+
+def test_freellmapi_prefers_the_x_routed_via_header_for_last_model(monkeypatch):
+    """The router's own header says which REAL provider/model actually
+    served a model="auto" request -- far more useful for the statusline
+    than echoing back the literal "auto" that was sent."""
+    provider = FreeLLMAPIProvider(api_key="k", model="auto", system_prompt="SYS")
+    response = _chat_response(model="auto")
+    response.headers = {"X-Routed-Via": "nvidia/meta-llama-3.2-11b-vision-instruct"}
+    monkeypatch.setattr(provider._session, "post", lambda **kw: response)
+    provider.reply([{"role": "user", "content": "hi"}])
+    assert provider.last_model == "nvidia/meta-llama-3.2-11b-vision-instruct"
+
+
+def test_freellmapi_falls_back_to_response_model_without_the_header(monkeypatch):
+    provider = FreeLLMAPIProvider(api_key="k", model="auto", system_prompt="SYS")
+    monkeypatch.setattr(provider._session, "post", lambda **kw: _chat_response(model="some/model"))
+    provider.reply([{"role": "user", "content": "hi"}])
+    assert provider.last_model == "some/model"
+
+
+def test_freellmapi_reply_updates_token_bookkeeping(monkeypatch):
+    provider = FreeLLMAPIProvider(api_key="k", system_prompt="SYS")
+    monkeypatch.setattr(provider._session, "post", lambda **kw: _chat_response(total_tokens=42))
+    provider.reply([{"role": "user", "content": "hi"}])
+    assert provider.total_tokens == 42
+
+
+def test_freellmapi_fallbacks_are_accepted_but_never_sent():
+    """FreeLLMAPI's own fallback chain lives in ITS dashboard, not the
+    request -- fallbacks is accepted only for constructor-shape parity with
+    OpenRouterProvider/NvidiaProvider."""
+    provider = FreeLLMAPIProvider(api_key="k", fallbacks=["some/model"], system_prompt="SYS")
+    assert provider.fallbacks == ["some/model"]
+
+
+def test_freellmapi_a_failure_raises_with_a_clear_message(monkeypatch):
+    provider = FreeLLMAPIProvider(api_key="k", system_prompt="SYS")
+    monkeypatch.setattr(provider._session, "post", lambda **kw: _FakeResponse(500, text="boom"))
+    with pytest.raises(RuntimeError, match="FreeLLMAPI 500: boom"):
+        provider.reply([{"role": "user", "content": "hi"}])
+
+
+def test_freellmapi_reply_with_image_uses_the_given_model(monkeypatch):
+    captured = {}
+
+    def fake_post(url, headers, json, timeout):
+        captured["payload"] = json
+        return _chat_response(content="a red circle")
+
+    provider = FreeLLMAPIProvider(api_key="k", system_prompt="SYS")
+    monkeypatch.setattr(provider._session, "post", fake_post)
+    result = provider.reply_with_image("what is this", "aGk=", "image/png", "vision-model")
+
+    assert result == "a red circle"
+    assert captured["payload"]["model"] == "vision-model"
+    assert captured["payload"]["messages"][0]["content"][1] == {
+        "type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="},
+    }
+
+
+def test_freellmapi_is_a_real_llm_provider_subclass():
+    provider = FreeLLMAPIProvider(api_key="k", system_prompt="SYS")
+    assert isinstance(provider, llm_provider.LLMProvider)
+
+
+def test_freellmapi_is_in_known_providers():
+    assert "freellmapi" in llm_provider.KNOWN_PROVIDERS
+
+
+# ---------------------------------------------------------------------------
+# list_freellmapi_models
+# ---------------------------------------------------------------------------
+
+def test_list_freellmapi_models_returns_sorted_ids(monkeypatch):
+    def fake_get(url, headers, timeout):
+        assert url == "http://localhost:3002/v1/models"
+        assert headers["Authorization"] == "Bearer fla-key"
+        return _FakeResponse(200, {"data": [{"id": "auto"}, {"id": "nvidia/some-model"}]})
+
+    monkeypatch.setattr(llm_provider.requests, "get", fake_get)
+    assert list_freellmapi_models("fla-key", "http://localhost:3002/v1") == ["auto", "nvidia/some-model"]
+
+
+def test_list_freellmapi_models_reports_a_connection_failure_clearly(monkeypatch):
+    import requests as real_requests
+
+    def raise_it(**kw):
+        raise real_requests.ConnectionError("connection refused")
+
+    monkeypatch.setattr(llm_provider.requests, "get", raise_it)
+    with pytest.raises(RuntimeError, match="Couldn't reach FreeLLMAPI"):
+        list_freellmapi_models("fla-key")

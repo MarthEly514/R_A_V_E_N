@@ -1,19 +1,22 @@
 """Conversation state and tool-calling orchestration."""
 import base64
 import json
+import math
 import mimetypes
 import re
 import time
 from pathlib import Path
 from typing import Callable
 
+from raven import config
+from raven import design as design_impl
 from raven.llm_provider import LLMProvider, SKILL_PROMPTS
 from raven.store import Store
 from raven import gmail as gmail_impl
 from raven import platforms as plat
 from raven import tools as tool_impl
 
-MAX_TOOL_ITERATIONS = 10  # was 5; browser workflows (navigate/read/act/verify) routinely need more
+MAX_TOOL_ITERATIONS = 300  # was 5; browser workflows (navigate/read/act/verify) routinely need more
 # ~12k tokens (chars/4 approximation) of history sent per request. This is a
 # practicality budget, not a model context-window limit — the free models
 # behind the default fallback list have context windows in the hundreds of
@@ -29,6 +32,10 @@ MAX_CONTEXT_CHARS = 48_000
 # The summary itself is capped so it stays genuinely space-saving and can't
 # grow unbounded across many compaction cycles over a very long-lived history.
 MAX_SUMMARY_CHARS = 2000
+# Design mode: caps the injected "canvas changed since your last turn" note
+# (see Assistant._pop_canvas_delta_summary) -- a burst of drags/resizes
+# shouldn't be able to grow this without bound.
+MAX_CANVAS_DELTA_CHARS = 800
 SAFE_GIT = {"status", "log", "diff", "show"}  # read-only git subcommands, no confirmation
 
 # run_command: read-only, side-effect-free programs that skip confirmation when
@@ -214,6 +221,51 @@ def _notification_body(reply: str) -> str:
     return text[:NOTIFICATION_BODY_CHARS].rstrip() + "…"
 
 
+def _coerce_numeric_strings(value):
+    """Recursively turns a JSON string that's actually a number (e.g. "80",
+    from a model that ignored the tool spec's declared "number"/"integer"
+    type -- a real, live-confirmed behavior, not a hypothetical) into a real
+    int/float, anywhere in a (possibly nested) tool-call argument structure.
+    A string that genuinely isn't numeric (a color, a motif name, a shape
+    id) simply fails to parse and is returned unchanged -- this never
+    touches anything that wasn't already a number written as text."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            pass
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    if isinstance(value, list):
+        return [_coerce_numeric_strings(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _coerce_numeric_strings(v) for k, v in value.items()}
+    return value
+
+
+_INVISIBLE = (None, "", "none", "transparent")
+FALLBACK_STROKE = "#141414"  # matches place_element's own default fill color
+
+
+def _ensure_visible(el: dict) -> None:
+    """A model can (and, live-confirmed, does) choose fill="none" for an
+    outline-only shape while ALSO leaving stroke as "none" (its own
+    default) -- the tool call succeeds and reports "Drew ...", but nothing
+    is actually visible on the canvas, which looks EXACTLY like the
+    drawing never happened at all from the user's point of view. Mutates
+    `el` in place to add a visible fallback stroke only in that specific
+    case -- a shape that deliberately sets a real stroke or fill is left
+    untouched."""
+    if (el.get("fill") or "").lower() in _INVISIBLE and (el.get("stroke") or "").lower() in _INVISIBLE:
+        el["stroke"] = FALLBACK_STROKE
+        if not el.get("stroke_width"):
+            el["stroke_width"] = 1.0
+
+
 def _has_shell_metachars(s: str) -> bool:
     return any(c in _SHELL_METACHARS for c in s)
 
@@ -243,6 +295,8 @@ class Assistant:
         confirm_run: Callable[[str], bool] = lambda cmd: True,
         store: Store | None = None,
         on_tool_call: Callable[[str, dict], None] = lambda name, args: None,
+        on_canvas_update: Callable[[dict], None] = lambda el: None,
+        on_canvas_delete: Callable[[str], None] = lambda element_id: None,
         settings: dict | None = None,
     ):
         self.provider = provider
@@ -250,6 +304,13 @@ class Assistant:
         self.store = store
         self.settings = settings or {}
         self.on_tool_call = on_tool_call  # notified (name, args) right before each tool runs
+        # Design mode: notified with the full element right after it's
+        # created/edited/grouped/ungrouped, and with just an id on delete --
+        # mirrors on_tool_call's shape (server.py binds these to websocket
+        # pushes; the CLI leaves them as no-ops, same "no rich UI, no push"
+        # posture analyze_image/browser tools already have).
+        self.on_canvas_update = on_canvas_update
+        self.on_canvas_delete = on_canvas_delete
         # C3: user-configured trust, ADDITIVE to SAFE_COMMANDS/SAFE_GIT (never
         # replaces them, and never bypasses the shell-metachar check below).
         permissions = (settings or {}).get("permissions", {})
@@ -266,12 +327,27 @@ class Assistant:
         # if/when it's next needed is cheap and correct either way.
         self.active_skills: set[str] = set()
         # V2: a SEPARATE model for analyze_image -- the main chat model isn't
-        # necessarily vision-capable. None (no settings, or no model.vision
-        # key) means analyze_image reports a clear error rather than trying
-        # and failing against a model that can't handle images.
-        self.vision_model = (settings or {}).get("model", {}).get("vision")
+        # necessarily vision-capable. Resolved against the ACTIVE provider
+        # (config.get_vision_model) rather than read as a flat value -- see
+        # that function's own docstring and DEFAULT_SETTINGS["model"]["vision"]
+        # for why a single hardcoded slug silently breaks the moment
+        # model.provider changes. None (no settings, or nothing configured
+        # for this provider) means analyze_image reports a clear error
+        # rather than trying and failing against a model that can't handle
+        # images.
+        self.vision_model = config.get_vision_model(settings or {})
         self.history: list[dict] = store.load() if store else []
         self._persisted = len(self.history)
+        # Design mode's canvas: persisted per-session exactly like history
+        # (store.load_canvas/save_canvas), so switching chats switches
+        # canvases too. _pending_canvas_changes accumulates a plain-English
+        # note per USER hand-edit (never R.A.V.E.N's own tool calls, which
+        # she already knows about) -- _context() prepends and clears it as a
+        # one-off summary message, so her next turn isn't reasoning from a
+        # canvas state she doesn't know changed (same "inject a summary"
+        # shape compaction already uses for dropped history, see _context).
+        self.canvas: list[dict] = store.load_canvas() if store else []
+        self._pending_canvas_changes: list[str] = []
         self.last_elapsed = 0.0  # wall time of the last completed ask(), in seconds
         self.last_reasoning: list[str] = []  # each call's reasoning trace, if the model gave one
         self._compacted_summary: str | None = None  # running summary of history[:self._compacted_through]
@@ -321,16 +397,29 @@ class Assistant:
         older is silently forgotten, only compressed."""
         start = self._drop_boundary()
         messages = self.history[start:]
-        if start == 0:
-            return messages
-        summary = self._compact(start)
-        if not summary:
-            return messages  # no provider to summarize with, or the call failed -- fall back to a plain drop
-        summary_msg = {
-            "role": "user",
-            "content": f"[Summary of {start} earlier messages, replaced here to stay within budget]\n{summary}",
-        }
-        return [summary_msg, *messages]
+        if start != 0:
+            summary = self._compact(start)
+            if summary:
+                summary_msg = {
+                    "role": "user",
+                    "content": f"[Summary of {start} earlier messages, replaced here to stay within budget]\n{summary}",
+                }
+                messages = [summary_msg, *messages]
+        canvas_note = self._pop_canvas_delta_summary()
+        return [canvas_note, *messages] if canvas_note else messages
+
+    def _pop_canvas_delta_summary(self) -> dict | None:
+        """A one-off "here's what changed on the canvas since you last looked"
+        message, built from hand-edits recorded by apply_canvas_edit/
+        group_elements/ungroup_elements -- popped (cleared) once read, so it's
+        sent exactly once, right before the turn that follows those edits."""
+        if not self._pending_canvas_changes:
+            return None
+        text = "\n".join(self._pending_canvas_changes)
+        if len(text) > MAX_CANVAS_DELTA_CHARS:
+            text = text[:MAX_CANVAS_DELTA_CHARS] + " …"
+        self._pending_canvas_changes = []
+        return {"role": "user", "content": f"[Canvas changed since your last turn:]\n{text}"}
 
     def _drop_boundary(self) -> int:
         """Index of the first message that's RETAINED verbatim under the
@@ -501,6 +590,288 @@ class Assistant:
         except Exception as e:
             return f"Error: {e}"
 
+    # -- Design mode: mathematically-generated shapes on the session's canvas ---
+    #
+    # Every element lives in self.canvas (a flat list -- a "group" element's
+    # children are nested INSIDE it, not separate top-level entries, so
+    # list/update/delete_canvas_element only ever address a top-level shape
+    # or a whole group at once, not one shape inside a group). Geometry is
+    # always DERIVED from "params" via raven/design.py's generators -- never
+    # hand-patched -- so editing params later regenerates exact geometry
+    # instead of drifting into an approximation. None of these tools confirm:
+    # they only ever mutate this session's own saved canvas, nothing external
+    # or hard to reverse (delete is trivially undoable -- redraw, or the
+    # UI's own undo), the same tier read-only/session-state tools already get.
+
+    _DESIGN_GENERATOR_FOR_TOOL = {
+        "draw_golden_rectangle": "golden_rectangle",
+        "draw_golden_spiral": "golden_spiral",
+        "draw_polygon": "regular_polygon",
+        "draw_star": "star_polygon",
+        "draw_grid": "grid_layout",
+        "draw_bezier": "bezier_curve",
+        "draw_lissajous": "lissajous_curve",
+    }
+    _PLACEMENT_ARG_KEYS = ("x", "y", "rotation", "fill", "stroke", "stroke_width")
+
+    def _run_design_tool(self, name: str, args: dict) -> str:
+        # Real bug, found live: several models (confirmed with a real
+        # NVIDIA-hosted model) send numeric tool arguments as JSON STRINGS
+        # ("80" instead of 80) even though the tool spec declares them
+        # "number"/"integer" -- the schema is only a hint to the model, never
+        # enforced by anything on the wire. Without this, every draw/update
+        # call from such a model crashed immediately (design.py's math does
+        # `radius * cos(...)`, and `"80" * cos(...)` raises a TypeError) --
+        # coercing here, once, at the tool boundary, means every generator
+        # and _apply_patch can keep trusting its inputs are real numbers.
+        args = _coerce_numeric_strings(args)
+        if name == "list_canvas_elements":
+            return self._list_canvas_elements()
+        if name == "update_canvas_element":
+            return self._update_canvas_element(args.get("element_id", ""), args.get("patch") or {})
+        if name == "delete_canvas_element":
+            return self._delete_canvas_element(args.get("element_id", ""))
+        if name == "draw_radial_pattern":
+            return self._draw_radial_pattern(args)
+        generator_name = self._DESIGN_GENERATOR_FOR_TOOL.get(name)
+        if generator_name is None:
+            return f"Unknown design tool: {name}"
+        return self._draw(generator_name, args)
+
+    def _draw(self, generator_name: str, args: dict) -> str:
+        gen_kwargs = {k: v for k, v in args.items() if k not in self._PLACEMENT_ARG_KEYS}
+        try:
+            geometry = design_impl.regenerate(generator_name, gen_kwargs)
+        except (ValueError, TypeError) as e:
+            return f"Error: {e}"
+        el = self._place_and_add(geometry, generator_name, args)
+        return self._describe_element(el, verb="Drew")
+
+    def _draw_radial_pattern(self, args: dict) -> str:
+        motif_name = args.get("motif")
+        motif_params = args.get("motif_params") or {}
+        if motif_name not in design_impl.GENERATORS:
+            return f"Error: unknown motif '{motif_name}' — use one of {sorted(design_impl.GENERATORS)}."
+        try:
+            motif = design_impl.GENERATORS[motif_name](**motif_params)
+            geometry = design_impl.radial_pattern(
+                motif, repetitions=args.get("repetitions", 6), orbit_radius=args.get("orbit_radius", 0.0),
+                spin_with_orbit=args.get("spin_with_orbit", True),
+            )
+        except (ValueError, TypeError) as e:
+            return f"Error: {e}"
+        el = self._place_and_add(geometry, "radial_pattern", args)
+        return self._describe_element(el, verb="Drew")
+
+    def _place_and_add(self, geometry: dict, generator_name: str, args: dict) -> dict:
+        el = design_impl.place_element(
+            geometry,
+            x=args.get("x", 0.0), y=args.get("y", 0.0), rotation=args.get("rotation", 0.0),
+            fill=args.get("fill", "#141414"), stroke=args.get("stroke", "none"),
+            stroke_width=args.get("stroke_width", 1.0), z=self._next_z(),
+        )
+        el["generator"] = generator_name
+        _ensure_visible(el)
+        self.canvas.append(el)
+        self._persist_canvas()
+        self.on_canvas_update(el)
+        return el
+
+    def _regenerate_element_geometry(self, el: dict) -> dict:
+        """Rebuilds an element's geometry from its (possibly just-edited)
+        params, by calling the exact generator that first created it.
+        radial_pattern is the one special case -- its own generator takes an
+        already-built motif ELEMENT, not flat params, so its motif has to be
+        rebuilt first from the motif params radial_pattern's own return
+        value already stores (see design.radial_pattern's "params")."""
+        generator_name = el.get("generator")
+        if generator_name == "radial_pattern":
+            p = el["params"]
+            motif = design_impl.GENERATORS[p["motif_type"]](**p["motif_params"])
+            return design_impl.radial_pattern(
+                motif, repetitions=p["repetitions"], orbit_radius=p["orbit_radius"],
+                spin_with_orbit=p["spin_with_orbit"],
+            )
+        return design_impl.regenerate(generator_name, el["params"])
+
+    def _find_element(self, element_id: str) -> dict | None:
+        return next((el for el in self.canvas if el["id"] == element_id), None)
+
+    def _next_z(self) -> int:
+        return max((el.get("z", 0) for el in self.canvas), default=-1) + 1
+
+    def _element_summary(self, el: dict) -> str:
+        kind = (el.get("generator") or el.get("type", "shape")).replace("_", " ")
+        return f"{kind} '{el['id']}' at ({el['x']:.0f}, {el['y']:.0f}), rotation {el['rotation']:.0f}"
+
+    def _describe_element(self, el: dict, verb: str) -> str:
+        return f"{verb} {self._element_summary(el)}."
+
+    def _list_canvas_elements(self) -> str:
+        if not self.canvas:
+            return "The canvas is empty."
+        lines = [
+            f"- {el['id']}: {el.get('generator', el['type'])} at ({el['x']:.0f}, {el['y']:.0f}), "
+            f"rotation {el['rotation']:.0f}, z={el['z']}, fill={el['fill']}, stroke={el['stroke']}, "
+            f"params={json.dumps(el.get('params', {}))}"
+            for el in sorted(self.canvas, key=lambda e: e["z"])
+        ]
+        return "Canvas elements (top to bottom is highest to lowest z):\n" + "\n".join(lines)
+
+    def _apply_patch(self, element_id: str, patch: dict) -> dict | None:
+        """Applies `patch` to an existing element -- a "params" key merges
+        into the element's existing params and regenerates geometry from the
+        result (never trusts client/model-sent geometry directly); any of
+        x/y/rotation/scale/fill/stroke/stroke_width/z just overwrite that
+        field. Shared by _update_canvas_element (a model tool call) and
+        apply_canvas_edit (a direct hand-edit from the UI, no model
+        involved) so both go through exactly the same regeneration logic."""
+        patch = _coerce_numeric_strings(patch)  # same defensive coercion _run_design_tool does
+        el = self._find_element(element_id)
+        if el is None:
+            return None
+        if "params" in patch:
+            el["params"] = {**el.get("params", {}), **patch["params"]}
+            geometry = self._regenerate_element_geometry(el)
+            for key in ("points", "d", "children"):
+                el.pop(key, None)
+                if key in geometry:
+                    el[key] = geometry[key]
+            el["params"] = geometry.get("params", el["params"])
+        for key in ("x", "y", "rotation", "scale", "fill", "stroke", "stroke_width", "z"):
+            if key in patch:
+                el[key] = patch[key]
+        if "fill" in patch or "stroke" in patch:
+            _ensure_visible(el)  # same invisible-shape guard _place_and_add applies on creation
+        self._persist_canvas()
+        return el
+
+    def _update_canvas_element(self, element_id: str, patch: dict) -> str:
+        try:
+            el = self._apply_patch(element_id, patch)
+        except (ValueError, TypeError, KeyError) as e:
+            return f"Error: couldn't apply those changes: {e}"
+        if el is None:
+            return f"Error: no element with id '{element_id}'. Call list_canvas_elements first."
+        self.on_canvas_update(el)
+        return self._describe_element(el, verb="Updated")
+
+    def apply_canvas_edit(self, element_id: str, patch: dict) -> dict | None:
+        """The user's own hand-edit (drag/resize/rotate/recolor/reparametrize/
+        reorder) made directly in the UI -- server.py calls this straight
+        from the websocket handler, bypassing the model entirely (a drag
+        doesn't need an LLM round trip). Recorded as a pending delta (see
+        _pop_canvas_delta_summary) since, unlike a model-driven
+        update_canvas_element call, R.A.V.E.N did not just do this herself
+        and has no other way to find out before her next turn."""
+        try:
+            el = self._apply_patch(element_id, patch)
+        except (ValueError, TypeError, KeyError):
+            return None
+        if el is not None:
+            self._pending_canvas_changes.append(f"User edited {self._element_summary(el)}.")
+            self.on_canvas_update(el)
+        return el
+
+    def _delete_canvas_element(self, element_id: str) -> str:
+        el = self._find_element(element_id)
+        if el is None:
+            return f"Error: no element with id '{element_id}'. Call list_canvas_elements first."
+        self.canvas.remove(el)
+        self._persist_canvas()
+        self.on_canvas_delete(element_id)
+        return f"Deleted {(el.get('generator') or el['type']).replace('_', ' ')} '{element_id}'."
+
+    def delete_canvas_element_by_user(self, element_id: str) -> bool:
+        """Same as _delete_canvas_element, but from the UI (server.py) rather
+        than a model tool call -- recorded as a pending delta for the same
+        reason apply_canvas_edit is."""
+        el = self._find_element(element_id)
+        if el is None:
+            return False
+        self.canvas.remove(el)
+        self._persist_canvas()
+        self._pending_canvas_changes.append(f"User deleted {self._element_summary(el)}.")
+        self.on_canvas_delete(element_id)
+        return True
+
+    def group_elements(self, element_ids: list[str]) -> dict | None:
+        """Groups existing top-level canvas elements into one new group
+        element, positioned at their centroid with an identity rotation/
+        scale -- each child's own x/y is re-expressed relative to that new
+        origin, so the group starts out visually identical to before
+        grouping (decision: a group carries its OWN transform layered over
+        each child's still-independent params, not baked-in absolute
+        positions -- see ungroup_elements for the inverse)."""
+        els = [el for el in self.canvas if el["id"] in element_ids]
+        if len(els) < 2:
+            return None
+        cx = sum(el["x"] for el in els) / len(els)
+        cy = sum(el["y"] for el in els) / len(els)
+        children = []
+        for el in els:
+            child = dict(el)
+            child["x"] = el["x"] - cx
+            child["y"] = el["y"] - cy
+            children.append(child)
+            self.canvas.remove(el)
+        group = design_impl.place_element(
+            {"type": "group", "children": children, "params": {}},
+            x=cx, y=cy, rotation=0.0, fill="none", stroke="none", z=self._next_z(),
+        )
+        self.canvas.append(group)
+        self._persist_canvas()
+        self._pending_canvas_changes.append(f"User grouped {len(children)} shapes into '{group['id']}'.")
+        self.on_canvas_update(group)
+        return group
+
+    def ungroup_elements(self, group_id: str) -> list[dict] | None:
+        """The inverse of group_elements: bakes the group's own x/y/rotation/
+        scale onto each child (standard rotate-then-scale-then-translate
+        composition, matching how the frontend renders a group as a nested
+        SVG <g transform=...>), so every child ends up exactly where it
+        visually was, as an independent top-level element again."""
+        group = self._find_element(group_id)
+        if group is None or group.get("type") != "group":
+            return None
+        theta = math.radians(group.get("rotation", 0.0))
+        scale = group.get("scale", 1.0)
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        restored = []
+        for child in group.get("children", []):
+            el = dict(child)
+            rx = child["x"] * cos_t - child["y"] * sin_t
+            ry = child["x"] * sin_t + child["y"] * cos_t
+            el["x"] = group["x"] + rx * scale
+            el["y"] = group["y"] + ry * scale
+            el["rotation"] = child.get("rotation", 0.0) + group.get("rotation", 0.0)
+            el["scale"] = child.get("scale", 1.0) * scale
+            el["z"] = self._next_z()
+            self.canvas.append(el)
+            restored.append(el)
+        self.canvas.remove(group)
+        self._persist_canvas()
+        self._pending_canvas_changes.append(f"User ungrouped '{group_id}' into {len(restored)} shapes.")
+        for el in restored:
+            self.on_canvas_update(el)
+        self.on_canvas_delete(group_id)
+        return restored
+
+    def restore_element(self, el: dict) -> dict:
+        """Puts a previously-deleted element back exactly as it was (same
+        id) -- the undo half of delete_canvas_element_by_user, from the
+        UI's own undo stack (the client keeps the full element it just
+        asked to delete, so undo can hand it straight back rather than
+        needing the server to have remembered it)."""
+        self.canvas.append(el)
+        self._persist_canvas()
+        self.on_canvas_update(el)
+        return el
+
+    def _persist_canvas(self) -> None:
+        if self.store:
+            self.store.save_canvas(self.canvas)
+
     def forget(self) -> None:
         """Clear conversation history, in memory and on disk. Stale tool results
         (e.g. "app X isn't installed") can otherwise sit in context indefinitely
@@ -637,6 +1008,13 @@ class Assistant:
             # since it's a real, skill-gated tool from the model's point of
             # view, just not a plain tool_impl.py function underneath.
             return self._analyze_image(args.get("path", ""), args.get("question") or "Describe this image.")
+        if name in tool_impl.SKILLS.get("design", ()):
+            # Same interception shape again -- every design tool needs live
+            # access to self.canvas (list/create/edit/delete a shape), which
+            # a stateless tool_impl.py function has no way to reach. Never
+            # confirmed (see _run_design_tool's own module-level note): these
+            # only ever touch this session's own canvas, nothing external.
+            return self._run_design_tool(name, args)
         prompt = self._confirm_prompt(name, args, self.allowed_commands, self.allowed_git)
         if prompt:
             plat.current().notify("R.A.V.E.N needs confirmation", prompt)

@@ -1,6 +1,7 @@
 """CLI entry point for R.A.V.E.N."""
 import argparse
 import getpass
+import os
 
 from pathlib import Path
 
@@ -17,8 +18,13 @@ from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
-from raven.config import get_api_key, load_settings, save_settings, SETTINGS_PATH, NOTES_PATH
-from raven.llm_provider import LLMProvider, NvidiaProvider, OpenRouterProvider, load_project_rules
+from raven.config import (
+    get_api_key, get_user_name, load_settings, save_settings, PROVIDER_API_KEY_ENV, SETTINGS_PATH, NOTES_PATH,
+)
+from raven.llm_provider import (
+    LLMProvider, NvidiaProvider, OpenRouterProvider, FreeLLMAPIProvider,
+    FREELLMAPI_DEFAULT_BASE_URL, load_project_rules,
+)
 from raven.assistant import Assistant
 from raven.store import Store
 from raven import tools, statusline, voice
@@ -31,7 +37,6 @@ ASSISTANT: Assistant | None = None  # populated in main(); /forget clears its hi
 
 # primary_color = "#C9A3FF"
 primary_color = "white"
-user = "Ely514"
 
 console = Console()
 
@@ -40,12 +45,18 @@ PROMPT_STYLE = Style.from_dict({
     "completion-menu.completion.current": f"bg:#000000 fg:{primary_color} bold",
 })
 
-STARTUP_SENTENCES = [
-    f"Good morning {user}. Systems are ready. What are we working on today?",
-    "Welcome back. I'm ready to assist. What is our first task?",
-    "Hello. File and shell tools are initialized. How can I help you today?",
-    "Online and ready. Let me know what you need to accomplish.",
-]
+
+def startup_sentences(name: str) -> list[str]:
+    """The startup banner's candidate greetings -- `name` is whatever the
+    user set via onboarding/`/name` (see get_user_name), never a hardcoded
+    value. Built fresh per call (not a module-level constant) since it
+    depends on settings loaded at runtime."""
+    return [
+        f"Good morning {name}. Systems are ready. What are we working on today?",
+        "Welcome back. I'm ready to assist. What is our first task?",
+        "Hello. File and shell tools are initialized. How can I help you today?",
+        "Online and ready. Let me know what you need to accomplish.",
+    ]
 
 THINKING_WORDS = [
     "Working on it...",
@@ -71,7 +82,8 @@ THINKING_WORDS = [
     "Combusting...",
     "Vibe coding...",
     "Crushing...",
-    
+    "Sipping...",
+    "Levitating...",
 ]
 
 # A small custom Rich spinner (registered into rich.spinner.SPINNERS, the
@@ -147,6 +159,17 @@ TOOL_STATUS = {
     "gmail_send_message": lambda a: f"Sending an email to {a.get('to', '')}...",
     "gmail_reply_message": lambda a: "Preparing a reply...",
     "load_skill": lambda a: f"Loading skill: {a.get('name', '')}...",
+    "draw_golden_rectangle": lambda a: "Drawing a golden rectangle...",
+    "draw_golden_spiral": lambda a: "Drawing a golden spiral...",
+    "draw_polygon": lambda a: f"Drawing a {a.get('sides', 6)}-sided polygon...",
+    "draw_star": lambda a: f"Drawing a {a.get('points', 5)}-pointed star...",
+    "draw_radial_pattern": lambda a: f"Drawing a radial pattern ({a.get('motif', 'a shape')})...",
+    "draw_grid": lambda a: "Drawing a grid...",
+    "draw_bezier": lambda a: "Drawing a Bezier curve...",
+    "draw_lissajous": lambda a: "Drawing a Lissajous curve...",
+    "list_canvas_elements": lambda a: "Looking at the canvas...",
+    "update_canvas_element": lambda a: f"Updating shape {a.get('element_id', '')}...",
+    "delete_canvas_element": lambda a: f"Deleting shape {a.get('element_id', '')}...",
 }
 
 
@@ -171,6 +194,9 @@ def show_help(_args: str = ""):
     table.add_row("/compact", "Summarize older history to free up context budget now")
     table.add_row("/notes", "Show saved cross-session notes (~/.raven/memory/notes.md)")
     table.add_row("/skills", "Show which skills are currently loaded this session")
+    table.add_row("/name [name]", "Show or set the name R.A.V.E.N calls you")
+    table.add_row("/provider [name]", "Show or switch the model provider (openrouter, nvidia, freellmapi)")
+    table.add_row("/apikey [provider]", "Set the API key for a provider (current provider if omitted)")
     table.add_row("/exit", "Exit R.A.V.E.N")
     console.print(table)
     console.print()
@@ -260,6 +286,90 @@ def handle_statusline(args: str):
     console.print(f"[green]✓ Status line: {'  •  '.join(names)}[/green]")
 
 
+def _construct_provider(model_cfg: dict, settings: dict) -> LLMProvider:
+    """Build the LLMProvider for `model_cfg`, resolving its API key against
+    `settings` first (so a key saved via /apikey or onboarding is used)
+    then the environment -- see get_api_key. Factored out of
+    build_assistant so /apikey and /provider can rebuild the LIVE provider
+    in place, without a restart, the same way server.py's _run_set_model
+    does for the desktop app."""
+    provider_name = model_cfg.get("provider", "openrouter")
+    api_key = get_api_key(provider_name, settings)
+    if provider_name == "nvidia":
+        provider_cls, extra_kwargs = NvidiaProvider, {}
+    elif provider_name == "freellmapi":
+        provider_cls = FreeLLMAPIProvider
+        extra_kwargs = {"base_url": os.environ.get("FREELLMAPI_BASE_URL", FREELLMAPI_DEFAULT_BASE_URL)}
+    else:
+        provider_cls, extra_kwargs = OpenRouterProvider, {}
+    return provider_cls(
+        api_key=api_key, model=model_cfg["name"], fallbacks=model_cfg.get("fallbacks", []), **extra_kwargs
+    )
+
+
+def handle_name(args: str):
+    name = args.strip()
+    if not name:
+        current = SETTINGS.get("user", {}).get("name", "").strip() or "(not set)"
+        console.print(f"[dim]Your name: {current}. Set with '/name <name>'.[/]")
+        console.print()
+        return
+    SETTINGS.setdefault("user", {})["name"] = name
+    save_settings(SETTINGS)
+    console.print(f"[green]✓ I'll call you {name} from now on.[/green]")
+    console.print()
+
+
+def handle_provider(args: str):
+    assert ASSISTANT is not None
+    choice = args.strip().lower()
+    if not choice:
+        current = SETTINGS["model"].get("provider", "openrouter")
+        console.print(f"[dim]Current provider: {current}. Choose from: {', '.join(PROVIDER_API_KEY_ENV)}.[/]")
+        console.print()
+        return
+    if choice not in PROVIDER_API_KEY_ENV:
+        console.print(f"[red]Unknown provider: {choice}[/red]  [dim]choose from: {', '.join(PROVIDER_API_KEY_ENV)}[/dim]")
+        return
+    new_model_cfg = {**SETTINGS["model"], "provider": choice}
+    try:
+        new_provider = _construct_provider(new_model_cfg, SETTINGS)
+    except RuntimeError as e:
+        console.print(f"[red]Couldn't switch to {choice}: {e}[/red]  [dim]set a key first with '/apikey {choice}'.[/]")
+        return
+    SETTINGS["model"] = new_model_cfg
+    save_settings(SETTINGS)
+    ASSISTANT.provider = new_provider
+    console.print(f"[green]✓ Switched to {choice} ({new_model_cfg['name']}).[/green]")
+    console.print()
+
+
+def handle_apikey(args: str):
+    assert ASSISTANT is not None
+    provider_name = args.strip().lower() or SETTINGS["model"].get("provider", "openrouter")
+    if provider_name not in PROVIDER_API_KEY_ENV:
+        console.print(f"[red]Unknown provider: {provider_name}[/red]  [dim]choose from: {', '.join(PROVIDER_API_KEY_ENV)}[/dim]")
+        return
+    key = console.input(f"Paste your {provider_name} API key (leave blank to cancel): ", password=True).strip()
+    if not key:
+        console.print("[dim]Cancelled.[/dim]")
+        return
+    SETTINGS.setdefault("api_keys", {})[provider_name] = key
+    save_settings(SETTINGS)
+    if provider_name == SETTINGS["model"].get("provider", "openrouter"):
+        try:
+            ASSISTANT.provider = _construct_provider(SETTINGS["model"], SETTINGS)
+            console.print(f"[green]✓ Saved and applied the new API key for {provider_name}.[/green]")
+        except RuntimeError as e:
+            console.print(f"[red]Saved, but couldn't apply it: {e}[/red]")
+    else:
+        console.print(
+            f"[green]✓ Saved the API key for {provider_name}.[/green] "
+            f"[dim](not your current provider -- switch with '/provider {provider_name}' to use it)[/]"
+        )
+    console.print()
+
+
 def handle_read(args: str):
     try:
         console.print(tools.read_file(args.strip()))
@@ -310,6 +420,9 @@ COMMANDS = {
     "/compact": handle_compact,
     "/notes": handle_notes,
     "/skills": handle_skills,
+    "/name": handle_name,
+    "/provider": handle_provider,
+    "/apikey": handle_apikey,
     "/exit": handle_exit,
     "/quit": handle_exit,
 
@@ -514,20 +627,17 @@ def build_assistant(confirm_run_fn) -> tuple[Assistant, LLMProvider]:
     headless -p mode so the two can't drift apart. Populates the module-level
     SETTINGS/ASSISTANT globals (used by /statusline, /forget, the toolbar).
 
-    Which LLMProvider subclass gets built (OpenRouter, NVIDIA, ...) is
+    Which LLMProvider subclass gets built (OpenRouter, NVIDIA, FreeLLMAPI) is
     settings.json's model.provider. Branches directly on OpenRouterProvider/
-    NvidiaProvider here (not llm_provider.build_provider's shared PROVIDERS
-    dict) so `patch.object(cli, "OpenRouterProvider")` keeps working in
-    tests -- same "small, deliberate duplication over cross-module coupling"
-    tradeoff server.py's own _build_assistant already documents."""
+    NvidiaProvider/FreeLLMAPIProvider here (not llm_provider.build_provider's
+    shared PROVIDERS dict) so `patch.object(cli, "OpenRouterProvider")` keeps
+    working in tests -- same "small, deliberate duplication over
+    cross-module coupling" tradeoff server.py's own _build_assistant already
+    documents."""
     global ASSISTANT
     SETTINGS.clear()
     SETTINGS.update(load_settings())
-    model_cfg = SETTINGS["model"]
-    provider_name = model_cfg.get("provider", "openrouter")
-    api_key = get_api_key(provider_name)
-    provider_cls = NvidiaProvider if provider_name == "nvidia" else OpenRouterProvider
-    provider = provider_cls(api_key=api_key, model=model_cfg["name"], fallbacks=model_cfg.get("fallbacks", []))
+    provider = _construct_provider(SETTINGS["model"], SETTINGS)
     assistant = ASSISTANT = Assistant(provider, confirm_run=confirm_run_fn, store=Store(), settings=SETTINGS)
     return assistant, provider
 
@@ -538,14 +648,69 @@ def run_headless(prompt: str, auto_confirm: bool = False) -> None:
     Confirmation-gated tool calls are DENIED by default (never silently
     approved just because no one's watching); pass auto_confirm to opt in."""
     confirm = (lambda action: True) if auto_confirm else (lambda action: False)
-    assistant, _ = build_assistant(confirm)
+    # Headless mode is for scripting -- it never prompts interactively (see
+    # the -y/--yes flag's own docstring for the matching "never silently
+    # approve" posture on confirmations). A missing API key is reported the
+    # same clean way, not a traceback: run onboarding or set one with
+    # /apikey in an interactive session first.
+    try:
+        assistant, _ = build_assistant(confirm)
+    except RuntimeError as e:
+        print(f"Setup needed: {e}")
+        raise SystemExit(1)
     try:
         reply = assistant.ask(prompt)
     except Exception as e:
         print(f"I ran into an error: {e}")
         raise SystemExit(1)
     print(reply)
-    
+
+
+def onboarding_needed(settings: dict) -> bool:
+    """Whether the interactive REPL should run first-run setup before doing
+    anything else: the user's name was never set, or there's no usable API
+    key (settings.json's api_keys OR an env var) for the currently
+    configured provider. Checked fresh each launch -- cheap, and correct
+    even if settings.json was hand-edited since the last run."""
+    if not get_user_name(settings):
+        return True
+    try:
+        get_api_key(settings["model"].get("provider", "openrouter"), settings)
+        return False
+    except RuntimeError:
+        return True
+
+
+def run_onboarding(console: Console, settings: dict) -> None:
+    """First-run setup: the user's own name, plus a provider + API key if
+    none is configured -- so a fresh install never requires hand-editing
+    .env or settings.json. Mutates and persists `settings` in place.
+    Safe to skip entirely (onboarding_needed already returned False) or to
+    redo later piecemeal via /name, /provider, /apikey."""
+    console.print(f"[bold {primary_color}]Welcome to R.A.V.E.N[/] — let's get you set up. "
+                  "[dim](change any of this later with /name, /provider, /apikey)[/]\n")
+    if not get_user_name(settings):
+        name = console.input("What should I call you? ").strip()
+        settings.setdefault("user", {})["name"] = name or "there"
+    provider = settings["model"].get("provider", "openrouter")
+    try:
+        get_api_key(provider, settings)
+    except RuntimeError:
+        console.print(f"\nNo API key found for provider [bold]{provider}[/]. "
+                      f"Available: {', '.join(PROVIDER_API_KEY_ENV)}.")
+        choice = console.input(f"Provider [{provider}]: ").strip().lower()
+        if choice:
+            if choice in PROVIDER_API_KEY_ENV:
+                provider = choice
+            else:
+                console.print(f"[red]Unknown provider {choice!r}, keeping {provider}.[/red]")
+        settings["model"]["provider"] = provider
+        key = console.input(f"Paste your {provider} API key: ", password=True).strip()
+        settings.setdefault("api_keys", {})[provider] = key
+    save_settings(settings)
+    console.print("[green]✓ Setup saved.[/]\n")
+
+
 def schedule_word_rotation(status, words, interval=5.0, shimmer_interval=0.12):
     """Drives the "thinking" status while waiting on the model: a random
     word from `words` every `interval` seconds, with a shimmer sweep
@@ -630,7 +795,15 @@ def main():
         run_headless(args.prompt, auto_confirm=args.yes)
         return
 
-    assistant, provider = build_assistant(confirm_run)
+    settings = load_settings()
+    if onboarding_needed(settings):
+        run_onboarding(console, settings)
+
+    try:
+        assistant, _ = build_assistant(confirm_run)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        return
     # Interactive only -- run_headless() never calls this, so a sudo command
     # there still just fails cleanly with no cached credential, same as
     # before (no TTY to safely prompt on, and -p/--yes must stay scriptable).
@@ -638,7 +811,10 @@ def main():
 
     def bottom_toolbar():
         thoughts = "expanded" if UI_STATE["show_thoughts"] else "collapsed"
-        header = (statusline.render(provider, assistant, SETTINGS["statusline"]["segments"])
+        # assistant.provider, not a captured local -- /apikey and /provider
+        # rebuild it in place (see handle_apikey/handle_provider), and this
+        # must reflect that on the very next redraw, not just after a restart.
+        header = (statusline.render(assistant.provider, assistant, SETTINGS["statusline"]["segments"])
                   + f"   [ctrl+o: thoughts {thoughts}]" + voice_toolbar_hint(UI_STATE["recording"], UI_STATE["voice_status"]))
         return header + reasoning_toolbar_text(assistant.last_reasoning, UI_STATE["show_thoughts"])
 
@@ -656,7 +832,8 @@ def main():
 █▀▄ ▄ █▀█ ▄ ▀▄▀ ▄ ██▄ ▄ █ ▀█
 """, style=primary_color)
 
-    console.print(f"[bold {primary_color}]R.A.V.E.N[/] — {STARTUP_SENTENCES[randint(0, len(STARTUP_SENTENCES)-1)]} [dim](type '/help' for commands, '/exit' to quit)[/]")
+    sentences = startup_sentences(SETTINGS.get("user", {}).get("name") or "there")
+    console.print(f"[bold {primary_color}]R.A.V.E.N[/] — {sentences[randint(0, len(sentences)-1)]} [dim](type '/help' for commands, '/exit' to quit)[/]")
     if assistant.history:
         console.print(f"[dim]Resumed {len(assistant.history)} messages from earlier sessions.[/]")
     _, rules_paths = load_project_rules()

@@ -10,6 +10,7 @@ import Composer from './ui/Composer';
 import StatsBlock from './ui/StatsBlock';
 import ChatStage from './stages/ChatStage';
 import VoiceStage from './stages/VoiceStage';
+import DesignStage from './stages/DesignStage';
 import SettingsPanel from './ui/SettingsPanel';
 import { useApplyTheme, useSettings } from './useSettings';
 
@@ -35,9 +36,10 @@ import { useApplyTheme, useSettings } from './useSettings';
 export default function App() {
   const {
     connected, messages, busy, cancelling, statusText, toolLog, pendingConfirm, error, sessions, currentSession, stats,
-    modelConfig, modelsByProvider, modelsLoading, modelsError,
+    modelConfig, modelsByProvider, modelsLoading, modelsError, userConfig, canvasElements,
     ask, cancelAsk, respondToConfirm, dismissError, newSession, openSession, deleteSession, requestTranscribe,
-    getModelConfig, listModels, setModel,
+    getModelConfig, listModels, setModel, getUserConfig, setApiKey, setUserName,
+    editCanvasElement, deleteCanvasElement, groupCanvasElements, ungroupCanvasElement, restoreCanvasElement,
   } = useRaven();
   const [tab, setTab] = useState<'activity' | 'history'>('activity');
   const [mode, setMode] = useState<'chat' | 'voice' | 'design'>('chat');
@@ -200,6 +202,23 @@ export default function App() {
           requestTranscribe={requestTranscribe}
           onSend={ask}
         />}
+        {mode === 'design' && <DesignStage
+          canvasElements={canvasElements}
+          busy={busy}
+          cancelling={cancelling}
+          statusText={statusText}
+          error={error}
+          connected={connected}
+          pendingConfirm={pendingConfirm}
+          onSend={ask}
+          onCancel={cancelAsk}
+          onDismissError={dismissError}
+          editCanvasElement={editCanvasElement}
+          deleteCanvasElement={deleteCanvasElement}
+          groupCanvasElements={groupCanvasElements}
+          ungroupCanvasElement={ungroupCanvasElement}
+          restoreCanvasElement={restoreCanvasElement}
+        />}
 
         {/* Right rail */}
         <aside className="min-h-0 overflow-y-auto max-[900px]:hidden">
@@ -228,7 +247,7 @@ export default function App() {
           {pendingConfirm && (
             <div className="mt-6 border border-ink bg-panel p-3.5">
               <div className="mb-3.5 text-[0.78rem] text-ink-dim">Approval needed</div>
-              <pre className="mb-3.5 max-h-56 overflow-y-auto font-[inherit] text-[0.82rem] whitespace-pre-wrap wrap-anywhere">
+              <pre className="mb-3.5 max-h-56 overflow-y-auto font-[inherit] noScrollbar text-[0.82rem] whitespace-pre-wrap wrap-anywhere">
                 {pendingConfirm.prompt}
               </pre>
               <div className="flex gap-2">
@@ -261,6 +280,10 @@ export default function App() {
           getModelConfig={getModelConfig}
           listModels={listModels}
           setModel={setModel}
+          userConfig={userConfig}
+          getUserConfig={getUserConfig}
+          setApiKey={setApiKey}
+          setUserName={setUserName}
         />
       )}
     </div>
