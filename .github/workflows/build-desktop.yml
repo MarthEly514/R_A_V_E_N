@@ -1,8 +1,11 @@
 name: build-desktop
 
-# Builds the R.A.V.E.N desktop app installers on each OS. Manual (Actions tab ->
-# Run workflow) or on a version tag (v*). The app needs the Python package on the
-# user's machine (pip install .); it starts `python -m raven.server` itself.
+# Builds the R.A.V.E.N desktop app installers on each OS, plus the Python CLI's
+# sdist/wheel, and -- only when triggered by a version tag, never from a manual
+# workflow_dispatch -- publishes them all to a GitHub Release. Manual runs (Actions
+# tab -> Run workflow) just produce workflow artifacts to inspect, nothing public.
+# The desktop app needs the Python package on the user's machine (pip install .);
+# it starts `python -m raven.server` itself.
 on:
   workflow_dispatch:
   push:
@@ -36,3 +39,45 @@ jobs:
           name: raven-ui-${{ matrix.os }}
           path: raven_ui/out/make/**
           if-no-files-found: error
+
+  build-python:
+    name: python package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install build
+      - run: python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raven-python-dist
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, build-python]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten artifacts into one release-assets directory
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( \
+            -name '*.deb' -o -name '*.rpm' -o -name '*.zip' -o \
+            -name '*.exe' -o -name '*.nupkg' -o -name 'RELEASES' -o \
+            -name '*.whl' -o -name '*.tar.gz' \
+          \) -exec cp {} release-assets/ \;
+          ls -la release-assets
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true

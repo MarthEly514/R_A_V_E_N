@@ -13,3 +13,7 @@ dist/
 # Virtualenv (checked into this folder)
 venv/
 pyvenv.cfg
+
+# Stray R session files (not part of this project)
+.RData
+.Rhistory

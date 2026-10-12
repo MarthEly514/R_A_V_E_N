@@ -18,8 +18,12 @@ const config: ForgeConfig = {
   makers: [
     new MakerSquirrel({ name: 'raven_ui', setupIcon: './assets/icon.ico' }), // Windows installer (Setup.exe)
     new MakerZIP({}, ['darwin', 'win32']), // macOS .app in a zip; portable Windows build
-    new MakerRpm({ options: { icon: './assets/icon.png' } }), // Fedora / RHEL
-    new MakerDeb({ options: { icon: './assets/icon.png' } }), // Debian / Ubuntu
+    // `bin` MUST match packagerConfig.executableName above -- electron-installer-common's
+    // default (package.json's own "name", "raven_ui") doesn't, and silently fails at make
+    // time with "could not find the Electron app binary" since the packaged binary is
+    // actually named "raven-ui" (live-caught, not assumed -- see DEV_LOG's release step).
+    new MakerRpm({ options: { icon: './assets/icon.png', bin: 'raven-ui' } }), // Fedora / RHEL
+    new MakerDeb({ options: { icon: './assets/icon.png', bin: 'raven-ui' } }), // Debian / Ubuntu
   ],
   plugins: [
     new VitePlugin({
