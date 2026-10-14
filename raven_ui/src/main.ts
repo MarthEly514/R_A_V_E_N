@@ -1,11 +1,22 @@
 import { app, BrowserWindow, clipboard, ipcMain, session } from 'electron';
 import path from 'node:path';
 import started from 'electron-squirrel-startup';
+import { updateElectronApp } from 'update-electron-app';
 import { startServer, stopServer } from './serverProcess';
 
 // Handle creating/removing shortcuts on Windows when installing/uninstalling.
 if (started) {
   app.quit();
+}
+
+// In-app update, no manual reinstall: checks update.electronjs.org (which
+// reads this repo's GitHub Releases) at startup and every 10 minutes, downloads
+// silently, then prompts to restart. Only works where Squirrel can replace the
+// running app in place -- Windows (MakerSquirrel) and signed macOS builds. Our
+// macOS build isn't code-signed and Linux ships .deb/.rpm (OS package manager's
+// job, not ours), so this is a deliberate no-op there, not a bug.
+if (process.platform === 'win32') {
+  updateElectronApp({ repo: 'MarthEly514/R_A_V_E_N' });
 }
 
 const createWindow = () => {
@@ -58,6 +69,10 @@ app.on('ready', () => {
   // main process's `clipboard` import here is never sandboxed/restricted.
   ipcMain.handle('clipboard:writeText', (_event, text: string) => clipboard.writeText(text));
   ipcMain.handle('clipboard:readText', () => clipboard.readText());
+  // Settings panel's "App" version line -- app.getVersion() reads the packaged
+  // app's own package.json, which is the actual installed desktop build, not
+  // just whatever raven_ui/package.json says in source.
+  ipcMain.handle('app:getVersion', () => app.getVersion());
   void startServer(); // the UI reconnects on its own, so no need to wait for it
   createWindow();
 });

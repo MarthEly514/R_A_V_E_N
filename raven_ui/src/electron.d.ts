@@ -8,5 +8,8 @@ declare global {
       writeText: (text: string) => Promise<void>;
       readText: () => Promise<string>;
     };
+    electronApp: {
+      getVersion: () => Promise<string>;
+    };
   }
 }

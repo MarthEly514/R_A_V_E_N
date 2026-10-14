@@ -11,7 +11,7 @@ import uuid
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-from raven import voice
+from raven import __version__, voice
 from raven.assistant import Assistant
 from raven.config import get_api_key, get_user_name, load_settings, save_settings
 from raven.llm_provider import (
@@ -580,6 +580,7 @@ class Session:
         has_key = {p: bool(settings.get("api_keys", {}).get(p, "").strip()) for p in KNOWN_PROVIDERS}
         await self.websocket.send_json({
             "type": "user_config", "name": get_user_name(settings), "has_key": has_key,
+            "version": __version__,
         })
 
     async def _run_set_api_key(self, provider_name: str, key: str) -> None:

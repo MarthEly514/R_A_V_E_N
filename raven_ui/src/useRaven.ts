@@ -47,7 +47,7 @@ type ServerMessage =
   | { type: 'model_config'; provider: string; name: string }
   | { type: 'models'; provider: string; items: string[] }
   | { type: 'models_error'; provider: string; message: string }
-  | { type: 'user_config'; name: string; has_key: Record<string, boolean> }
+  | { type: 'user_config'; name: string; has_key: Record<string, boolean>; version: string }
   | { type: 'cancel_requested' }
   | { type: 'cancelled' }
   | { type: 'canvas'; session: number; elements: CanvasElement[] }
@@ -57,7 +57,7 @@ type ServerMessage =
 export type StatSegment = { name: string; text: string };
 export type ModelConfig = { provider: string; name: string };
 // has_key never carries the actual secret -- see server.py's _send_user_config.
-export type UserConfig = { name: string; has_key: Record<string, boolean> };
+export type UserConfig = { name: string; has_key: Record<string, boolean>; version: string };
 
 
 const SERVER_URL = 'ws://127.0.0.1:8756/ws';
@@ -241,7 +241,7 @@ export function useRaven() {
             setModelsError(data.message);
             break;
           case 'user_config':
-            setUserConfig({ name: data.name, has_key: data.has_key });
+            setUserConfig({ name: data.name, has_key: data.has_key, version: data.version });
             break;
           case 'confirm_request':
             setPendingConfirm({ id: data.id, prompt: data.prompt });

@@ -10,3 +10,7 @@ contextBridge.exposeInMainWorld('electronClipboard', {
     writeText: (text: string) => ipcRenderer.invoke('clipboard:writeText', text),
     readText: () => ipcRenderer.invoke('clipboard:readText'),
 });
+
+contextBridge.exposeInMainWorld('electronApp', {
+    getVersion: () => ipcRenderer.invoke('app:getVersion'),
+});

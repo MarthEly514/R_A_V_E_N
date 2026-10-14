@@ -678,6 +678,7 @@ def test_get_user_config_reports_name_and_which_providers_have_a_key():
     assert msg == {
         "type": "user_config", "name": "Ely",
         "has_key": {"openrouter": False, "nvidia": True, "freellmapi": False},
+        "version": server.__version__,
     }
 
 

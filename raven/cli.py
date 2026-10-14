@@ -27,7 +27,7 @@ from raven.llm_provider import (
 )
 from raven.assistant import Assistant
 from raven.store import Store
-from raven import tools, statusline, voice
+from raven import __version__, tools, statusline, voice
 from random import randint
 
 SETTINGS: dict = {}  # populated in main(); /statusline edits it live
@@ -206,6 +206,7 @@ def show_status(_args: str = ""):
     table = Table(title="R.A.V.E.N System Status")
     table.add_column("Component", style=primary_color)
     table.add_column("Status")
+    table.add_row("Version", __version__)
     table.add_row("CPU", f"{psutil.cpu_percent(interval=0.3):.1f}%")
     table.add_row("Memory", f"{psutil.virtual_memory().percent:.1f}%")
     table.add_row("Disk", f"{psutil.disk_usage(Path.cwd().anchor or '/').percent:.1f}%")

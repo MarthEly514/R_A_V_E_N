@@ -72,6 +72,15 @@ macOS Gatekeeper will warn on first launch (code signing needs a paid developer
 certificate). Each OS has to be built on that OS -- the `build-desktop` GitHub Action
 does all three on a tag or a manual run.
 
+On Windows, the app checks for new tagged GitHub Releases itself (via
+[`update-electron-app`](https://github.com/electron/update-electron-app), every 10
+minutes and at startup) and downloads+prompts to restart -- no manual reinstall. macOS
+would need its builds code-signed for the same thing to work there; Linux's `.deb`/`.rpm`
+update the normal way, through your package manager. Settings shows both the desktop
+app's own version and the Python backend's (`raven.__version__`) -- if they look out of
+sync after an update, re-run `pip install .` (or the `pip install git+...@vX.Y.Z` command
+above) to bring the backend current too.
+
 ### Cancelling a request
 
 The Send button becomes a **Cancel** button while R.A.V.E.N is working. Clicking it

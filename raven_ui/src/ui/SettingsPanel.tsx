@@ -61,6 +61,14 @@ function SettingsPanel({
   const [nameInput, setNameInput] = useState('');
   const [nameJustSaved, setNameJustSaved] = useState(false);
 
+  // App version comes from Electron's own app.getVersion() (main.ts), not
+  // package.json bundled into the renderer, so it reflects what's actually
+  // installed. null on the CLI/browser dev server where electronApp isn't bridged.
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+  useEffect(() => {
+    window.electronApp?.getVersion().then(setAppVersion).catch(() => {});
+  }, []);
+
   const provider = pickedProvider ?? modelConfig?.provider ?? 'openrouter';
   const models = modelsByProvider[provider] ?? [];
 
@@ -150,6 +158,15 @@ function SettingsPanel({
         </div>
 
         <div className="flex-1 overflow-y-auto">
+          {!connected && (
+            <div className="mb-5 border border-danger px-3 py-2 text-[0.8rem] text-danger">
+              Not connected to the R.A.V.E.N backend -- every action below is disabled until
+              it reconnects. If this doesn't clear up on its own, make sure the Python package
+              is installed (<code className="font-mono">pip install .</code> from the repo, or
+              run <code className="font-mono">raven-server</code> yourself) and restart the app.
+            </div>
+          )}
+
           <section className="mb-6">
             <div className="mb-2.5 text-[0.78rem] text-ink-dim">Appearance</div>
             <div className="flex gap-2">
@@ -327,6 +344,15 @@ function SettingsPanel({
               checked={voiceAutoSend}
               onChange={setVoiceAutoSend}
             />
+          </section>
+
+          <section className="mt-6 flex flex-col gap-1 border-t border-line-soft pt-4 text-[0.78rem] text-ink-dim">
+            <div>
+              App version: <span className="text-ink">{appVersion ?? 'unknown'}</span>
+            </div>
+            <div>
+              R.A.V.E.N backend: <span className="text-ink">{userConfig?.version ?? 'unknown'}</span>
+            </div>
           </section>
         </div>
       </div>
