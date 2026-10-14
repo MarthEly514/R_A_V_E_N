@@ -1,7 +1,7 @@
 {
   "name": "raven_ui",
   "productName": "R.A.V.E.N",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "R.A.V.E.N desktop app: a chat interface for the R.A.V.E.N agent",
   "main": ".vite/build/main.js",
   "private": true,
